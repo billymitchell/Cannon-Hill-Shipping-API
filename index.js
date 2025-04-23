@@ -1,54 +1,182 @@
 import fs from 'fs';
 import csvParser from 'csv-parser';
-import fetch from 'node-fetch';
 import express from 'express';
 import bodyParser from 'body-parser';
 import multer from 'multer';
+import stream from 'stream';
+import fetch from 'node-fetch';
 import 'dotenv/config';
 
-import cannonHillRouter from './routes/cannonHill.js';
-import submitRouter from './routes/submit.js';
-
-const upload = multer({ dest: 'uploads/' });
-
-let store_key = [
-    { STORE_ID: "21633", API_KEY: process.env.STORE_21633 },
-    { STORE_ID: "40348", API_KEY: process.env.STORE_40348 },
-    { STORE_ID: "12803", API_KEY: process.env.STORE_12803 },
-    { STORE_ID: "9672", API_KEY: process.env.STORE_9672 },
-    { STORE_ID: "47219", API_KEY: process.env.STORE_47219 },
-    { STORE_ID: "8366", API_KEY: process.env.STORE_8366 },
-    { STORE_ID: "16152", API_KEY: process.env.STORE_16152 },
-    { STORE_ID: "8466", API_KEY: process.env.STORE_8466 },
-    { STORE_ID: "15521", API_KEY: process.env.STORE_15521 },
-    { STORE_ID: "24121", API_KEY: process.env.STORE_24121 },
-    { STORE_ID: "14077", API_KEY: process.env.STORE_14077 },
-    { STORE_ID: "12339", API_KEY: process.env.STORE_12339 },
-    { STORE_ID: "43379", API_KEY: process.env.STORE_43379 },
-    { STORE_ID: "9369", API_KEY: process.env.STORE_9369 },
-    { STORE_ID: "9805", API_KEY: process.env.STORE_9805 },
-    { STORE_ID: "67865", API_KEY: process.env.STORE_67865 },
-    { STORE_ID: "48371", API_KEY: process.env.STORE_48371 },
-    { STORE_ID: "48551", API_KEY: process.env.STORE_48551 },
-    { STORE_ID: "110641", API_KEY: process.env.STORE_110641 },
-    { STORE_ID: "41778", API_KEY: process.env.STORE_41778 },
-    { STORE_ID: "8267", API_KEY: process.env.STORE_8267 },
-    { STORE_ID: "75092", API_KEY: process.env.STORE_75092 },
-    { STORE_ID: "8402", API_KEY: process.env.STORE_8402 },
-    { STORE_ID: "68125", API_KEY: process.env.STORE_68125 },
-    { STORE_ID: "8729", API_KEY: process.env.STORE_8729 },
-    { STORE_ID: "47257", API_KEY: process.env.STORE_47257 },
-    { STORE_ID: "8636", API_KEY: process.env.STORE_8636 },
-];
-
 const app = express();
+const upload = multer({ storage: multer.memoryStorage() });
 app.use(bodyParser.json());
 
-// Mount the route modules
-app.use('/cannon-hill', cannonHillRouter);
-app.use('/submit', submitRouter);
+// Utility Functions
+
+/**
+ * Logs messages to the console with optional data and log level.
+ * @param {string} message - The message to log.
+ * @param {any} data - Additional data to log (optional).
+ * @param {string} level - Log level ("info" or "error").
+ */
+const log = (message, data = null, level = "info") => {
+    const levels = { info: console.log, error: console.error };
+    levels[level](message, data || '');
+};
+
+/**
+ * Handles errors by logging them and sending a structured error response.
+ * @param {object} response - The Express response object.
+ * @param {Error} error - The error object.
+ * @param {number} statusCode - HTTP status code to send (default: 500).
+ */
+const handleError = (response, error, statusCode = 500) => {
+    console.error("Error:", error.message || error);
+
+    let parsedError;
+    try {
+        parsedError = JSON.parse(error.message || error);
+    } catch {
+        parsedError = error.message || error;
+    }
+
+    response.status(statusCode).json({
+        message: "An error occurred while processing the request",
+        error: {
+            status: statusCode,
+            response: parsedError.response || parsedError.stack || parsedError,
+        },
+    });
+};
+
+// CSV Parsing and Formatting
+
+/**
+ * Parses a CSV file from a buffer and normalizes the keys.
+ * @param {Buffer} buffer - The file buffer to parse.
+ * @returns {Promise<Array>} - A promise that resolves to an array of parsed data.
+ */
+const parseCSVFromBuffer = (buffer) => {
+    return new Promise((resolve, reject) => {
+        const results = [];
+        const readableStream = new stream.Readable();
+        readableStream.push(buffer);
+        readableStream.push(null);
+
+        readableStream
+            .pipe(csvParser({ skipLines: 4 }))
+            .on('data', (data) => {
+                const normalizedData = {};
+                Object.keys(data).forEach((key) => {
+                    const newKey = key.replace(/[- ]/g, '_');
+                    normalizedData[newKey] = data[key];
+                });
+                results.push(normalizedData);
+            })
+            .on('end', () => resolve(results))
+            .on('error', (error) => reject(error));
+    });
+};
+
+/**
+ * Formats parsed CSV data into the required structure for submission.
+ * @param {Array} results - The parsed CSV data.
+ * @returns {Array} - The formatted data.
+ */
+const formatCannonHillData = (results) => {
+    const shipmentMethodMap = { "G": "Ground", "3RD": "3 Day Select", "2ND": "2nd Day Air" };
+    const storeIdMap = { "RTSCS": "68125", "RTFMS": "118741", "HERO": "14077" };
+    const uniqueOrderIds = new Set();
+
+    return results.reduce((formattedData, item) => {
+        if (item['Cust_PO_Number']) {
+            const sanitizedValue = item['Cust_PO_Number'].split('/')[0].replace(/\D/g, '').trim();
+
+            if (sanitizedValue && !uniqueOrderIds.has(sanitizedValue)) {
+                let [carrier_code = "", shipment_method = ""] = (item.Shipped_VIA || "").split('-').map((part) => part.trim());
+                shipment_method = shipmentMethodMap[shipment_method] || shipment_method;
+
+                const mappedStoreId = storeIdMap[item.Customer_Number] || item.Customer_Number;
+
+                formattedData.push({
+                    source_id: `${mappedStoreId}-${sanitizedValue}`,
+                    tracking_number: item.Tracking_Number,
+                    carrier_code: carrier_code,
+                    shipment_method: shipment_method || "Residential",
+                });
+                uniqueOrderIds.add(sanitizedValue);
+            }
+        }
+        return formattedData;
+    }, []);
+};
+
+// API Interaction
+
+/**
+ * Sends formatted data to the submit route and handles the response.
+ * @param {Array} data - The formatted data to send.
+ * @returns {Promise<object>} - The response from the submit route.
+ */
+const postToSubmitRoute = async (data) => {
+    const submitRoute = "https://orderdesk-single-order-ship-65ffd8ceba36.herokuapp.com";
+    log("Payload being sent to submit route:", data);
+
+    const response = await fetch(submitRoute, {
+        method: 'POST',
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(JSON.stringify({ status: response.status, response: errorText }));
+    }
+
+    const jsonResponse = await response.json();
+    log("Raw response from submit route:", jsonResponse);
+
+    return {
+        status: jsonResponse.status || "success",
+        message: jsonResponse.message || "No message provided",
+        execution_time: jsonResponse.execution_time || "N/A",
+        results: simplifyPostResponses(jsonResponse.results || []),
+    };
+};
+
+/**
+ * Simplifies the responses from the submit route.
+ * @param {Array} postResponses - The responses from the submit route.
+ * @returns {Array} - Simplified responses.
+ */
+const simplifyPostResponses = (postResponses) =>
+    postResponses.map(({ postResponse = {} }) => ({
+        status: postResponse.status || "unknown",
+        message: postResponse.message || "No message provided",
+    }));
+
+// Route Handlers
+
+/**
+ * Handles the `/cannon-hill` POST route for processing uploaded CSV files.
+ */
+app.post('/cannon-hill', upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ message: "No file attached." });
+        }
+
+        const results = await parseCSVFromBuffer(req.file.buffer);
+        const formattedData = formatCannonHillData(results);
+        const submitResponse = await postToSubmitRoute(formattedData);
+
+        res.status(200).json(submitResponse);
+    } catch (error) {
+        handleError(res, error);
+    }
+});
+
+// Server Initialization
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => {
-    console.log(`Server running on port ${port}: http://localhost:${port}`);
-});
+app.listen(port, () => log(`Server running on port ${port}: http://localhost:${port}`));
