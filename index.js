@@ -119,7 +119,7 @@ const formatCannonHillData = (results) => {
  * @returns {Promise<object>} - The response from the submit route.
  */
 const postToSubmitRoute = async (data) => {
-    const submitRoute = "https://orderdesk-single-order-ship-65ffd8ceba36.herokuapp.com";
+    const submitRoute = "https://orderdesk-single-order-ship-65ffd8ceba36.herokuapp.com/";
     log("Payload being sent to submit route:", data);
 
     const response = await fetch(submitRoute, {
