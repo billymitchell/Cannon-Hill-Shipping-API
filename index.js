@@ -31,7 +31,7 @@ const log = (message, data = null, level = "info") => {
  * @param {number} statusCode - HTTP status code to send (default: 500).
  */
 const handleError = (response, error, statusCode = 500) => {
-    console.error("Error:", error.message || error);
+    log("Handling error", error, "error");
 
     let parsedError;
     try {
@@ -115,33 +115,48 @@ const formatCannonHillData = (results) => {
 
 /**
  * Sends formatted data to the submit route and handles the response.
+ * Includes retry logic and detailed error handling.
  * @param {Array} data - The formatted data to send.
  * @returns {Promise<object>} - The response from the submit route.
  */
-const postToSubmitRoute = async (data) => {
+const postToSubmitRoute = async (data, retries = 3) => {
     const submitRoute = "https://orderdesk-single-order-ship-65ffd8ceba36.herokuapp.com/";
-    log("Payload being sent to submit route:", data);
+    log("Preparing to send payload to submit route", data);
 
-    const response = await fetch(submitRoute, {
-        method: 'POST',
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data),
-    });
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            const response = await fetch(submitRoute, {
+                method: 'POST',
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(data),
+            });
 
-    if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(JSON.stringify({ status: response.status, response: errorText }));
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(JSON.stringify({ status: response.status, response: errorText }));
+            }
+
+            const jsonResponse = await response.json();
+            log("Response received from submit route", jsonResponse);
+
+            return {
+                status: jsonResponse.status || "success",
+                message: jsonResponse.message || "No message provided",
+                execution_time: jsonResponse.execution_time || "N/A",
+                results: simplifyPostResponses(jsonResponse.results || []),
+            };
+        } catch (error) {
+            log(`Attempt ${attempt} to submit data failed`, error, "error");
+
+            if (attempt === retries) {
+                log("All retry attempts failed", error, "error");
+                throw error;
+            }
+
+            // Wait before retrying (exponential backoff)
+            await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+        }
     }
-
-    const jsonResponse = await response.json();
-    log("Raw response from submit route:", jsonResponse);
-
-    return {
-        status: jsonResponse.status || "success",
-        message: jsonResponse.message || "No message provided",
-        execution_time: jsonResponse.execution_time || "N/A",
-        results: simplifyPostResponses(jsonResponse.results || []),
-    };
 };
 
 /**
@@ -155,23 +170,36 @@ const simplifyPostResponses = (postResponses) =>
         message: postResponse.message || "No message provided",
     }));
 
-// Route Handlers
-
 /**
- * Handles the `/cannon-hill` POST route for processing uploaded CSV files.
+ * Handles the `/` POST route for processing uploaded CSV files.
  */
-app.post('/cannon-hill', upload.single('file'), async (req, res) => {
+app.post('/', upload.single('file'), async (req, res) => {
     try {
+        // Check if a file is attached in the request
         if (!req.file) {
+            log("No file attached in the request", null, "error");
             return res.status(400).json({ message: "No file attached." });
         }
 
-        const results = await parseCSVFromBuffer(req.file.buffer);
-        const formattedData = formatCannonHillData(results);
-        const submitResponse = await postToSubmitRoute(formattedData);
+        log("File received, starting CSV parsing...");
 
+        // Parse the CSV file from the buffer
+        const results = await parseCSVFromBuffer(req.file.buffer);
+        log("CSV parsing completed successfully", results);
+
+        // Format the parsed data into the required structure
+        const formattedData = formatCannonHillData(results);
+        log("Data formatted successfully", formattedData);
+
+        // Send the formatted data to the submit route
+        const submitResponse = await postToSubmitRoute(formattedData);
+        log("Data submitted successfully to the submit route", submitResponse);
+
+        // Respond with the result from the submit route
         res.status(200).json(submitResponse);
     } catch (error) {
+        // Log the error and send a structured error response
+        log("Error occurred while processing the request", error, "error");
         handleError(res, error);
     }
 });
