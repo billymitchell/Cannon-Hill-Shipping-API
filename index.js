@@ -90,16 +90,23 @@ const formatCannonHillData = (results) => {
 
     return results.reduce((formattedData, item) => {
         if (item['Cust_PO_Number']) {
-            const sanitizedValue = item['Cust_PO_Number'].split('/')[0].replace(/\D/g, '').trim();
+            // Extract the first numeric value from Cust_PO_Number
+            const sanitizedValue = item['Cust_PO_Number']
+                .split(/[\/\s-]+/) // Split by "/", spaces, or "-"
+                .find((part) => /^\d+$/.test(part)) // Find the first numeric part
+                ?.trim(); // Trim any extra spaces
 
             if (sanitizedValue && !uniqueOrderIds.has(sanitizedValue)) {
                 let [carrier_code = "", shipment_method = ""] = (item.Shipped_VIA || "").split('-').map((part) => part.trim());
                 shipment_method = shipmentMethodMap[shipment_method] || shipment_method;
 
-                const mappedStoreId = storeIdMap[item.Customer_Number] || item.Customer_Number;
+                const mappedStoreId = storeIdMap[item.Customer_Number];
+                if (!mappedStoreId) {
+                    log(`Invalid store ID for Customer_Number: ${item.Customer_Number}`, item, "error");
+                }
 
                 formattedData.push({
-                    source_id: `${mappedStoreId}-${sanitizedValue}`,
+                    source_id: `${mappedStoreId || item.Customer_Number}-${sanitizedValue}`,
                     tracking_number: item.Tracking_Number,
                     carrier_code: carrier_code,
                     shipment_method: shipment_method || "Residential",
@@ -117,37 +124,56 @@ const formatCannonHillData = (results) => {
  * Sends formatted data to the submit route and handles the response.
  * Includes retry logic and detailed error handling.
  * @param {Array} data - The formatted data to send.
+ * @param {number} retries - Number of retry attempts in case of failure (default: 3).
  * @returns {Promise<object>} - The response from the submit route.
  */
 const postToSubmitRoute = async (data, retries = 3) => {
+    // Validate that the data is an array and not empty
+    if (!Array.isArray(data) || data.length === 0) {
+        log("No valid data to send to submit route", data, "error");
+        throw new Error("No valid data to send to submit route");
+    }
+
+    // Define the submit route URL
     const submitRoute = "https://orderdesk-single-order-ship-65ffd8ceba36.herokuapp.com/";
     log("Preparing to send payload to submit route", data);
+    log("Payload being sent to submit route", JSON.stringify(data, null, 2));
 
+    // Retry logic with exponential backoff
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
+            // Send the POST request to the submit route
             const response = await fetch(submitRoute, {
                 method: 'POST',
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(data),
             });
 
+            // Read the raw response as text
+            const rawResponse = await response.text();
+            log("Raw response from submit route", rawResponse);
+
+            // Check if the response status is not OK (e.g., 4xx or 5xx)
             if (!response.ok) {
-                const errorText = await response.text();
-                throw new Error(JSON.stringify({ status: response.status, response: errorText }));
+                throw new Error(JSON.stringify({ status: response.status, response: rawResponse }));
             }
 
-            const jsonResponse = await response.json();
-            log("Response received from submit route", jsonResponse);
+            // Parse the JSON response
+            const jsonResponse = JSON.parse(rawResponse);
+            log("Parsed response received from submit route", JSON.stringify(jsonResponse, null, 2));
 
+            // Return the structured response
             return {
-                status: jsonResponse.status || "success",
-                message: jsonResponse.message || "No message provided",
-                execution_time: jsonResponse.execution_time || "N/A",
-                results: simplifyPostResponses(jsonResponse.results || []),
+                status: jsonResponse.status || "success", // Default to "success" if status is missing
+                message: jsonResponse.message || "No message provided", // Default message if missing
+                execution_time: jsonResponse.execution_time || "N/A", // Default execution time if missing
+                results: simplifyPostResponses(jsonResponse.results || []), // Simplify the results array
             };
         } catch (error) {
+            // Log the error for the current attempt
             log(`Attempt ${attempt} to submit data failed`, error, "error");
 
+            // If all retries are exhausted, throw the error
             if (attempt === retries) {
                 log("All retry attempts failed", error, "error");
                 throw error;
@@ -161,14 +187,38 @@ const postToSubmitRoute = async (data, retries = 3) => {
 
 /**
  * Simplifies the responses from the submit route.
+ * This function processes the array of responses and extracts meaningful information.
  * @param {Array} postResponses - The responses from the submit route.
- * @returns {Array} - Simplified responses.
+ * @returns {Array} - Simplified responses with status and message.
  */
-const simplifyPostResponses = (postResponses) =>
-    postResponses.map(({ postResponse = {} }) => ({
-        status: postResponse.status || "unknown",
-        message: postResponse.message || "No message provided",
-    }));
+const simplifyPostResponses = (postResponses) => {
+    // Check if the responses array is valid and not empty
+    if (!Array.isArray(postResponses) || postResponses.length === 0) {
+        log("No valid responses received from the submit route", postResponses, "error");
+        return [{ status: "error", message: "No valid responses received" }];
+    }
+
+    // Map through each response and extract relevant details
+    return postResponses.map(({ postResponse = {}, error }) => {
+        // If there is an error, log it and return an error status
+        if (error) {
+            log("Error in response", error, "error");
+            return { status: "error", message: error };
+        }
+
+        // Extract status and message from the postResponse object
+        const status = postResponse.status || "unknown"; // Default to "unknown" if status is missing
+        const message = postResponse.message || "No message provided"; // Default message if missing
+
+        // Log incomplete responses for debugging
+        if (!postResponse.status || !postResponse.message) {
+            log("Incomplete response detected", postResponse, "error");
+        }
+
+        // Return the simplified response object
+        return { status, message };
+    });
+};
 
 /**
  * Handles the `/` POST route for processing uploaded CSV files.
