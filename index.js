@@ -3,16 +3,53 @@ import bodyParser from 'body-parser';
 import multer from 'multer';
 import fetch from 'node-fetch';
 import ExcelJS from 'exceljs';
+import { randomUUID } from 'crypto';
 import 'dotenv/config';
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
 app.use(bodyParser.json());
 
 const XLSM_MIME_TYPES = new Set([
     "application/vnd.ms-excel.sheet.macroenabled.12",
     "application/octet-stream",
 ]);
+
+const parsedMaxAttachmentSizeMb = Number.parseInt(process.env.MAX_ATTACHMENT_SIZE_MB || "10", 10);
+const MAX_ATTACHMENT_SIZE_MB = Number.isFinite(parsedMaxAttachmentSizeMb) && parsedMaxAttachmentSizeMb > 0
+    ? parsedMaxAttachmentSizeMb
+    : 10;
+const MAX_ATTACHMENT_SIZE_BYTES = MAX_ATTACHMENT_SIZE_MB * 1024 * 1024;
+
+const isXLSMAttachment = (file = {}) => {
+    const fieldName = (file.fieldname || "").toLowerCase();
+    const fileName = (file.originalname || "").toLowerCase();
+    const mimeType = (file.mimetype || "").toLowerCase();
+    const isAttachmentField = fieldName === "file" || fieldName.startsWith("attachment-");
+
+    return (
+        isAttachmentField &&
+        (
+            fileName.endsWith(".xlsm") ||
+            XLSM_MIME_TYPES.has(mimeType)
+        )
+    );
+};
+
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+        fileSize: MAX_ATTACHMENT_SIZE_BYTES,
+        files: 20,
+    },
+    fileFilter: (req, file, cb) => {
+        if (isXLSMAttachment(file)) {
+            return cb(null, true);
+        }
+
+        // Ignore non-.xlsm attachments instead of buffering them.
+        cb(null, false);
+    },
+});
 
 // Utility Functions
 
@@ -23,15 +60,86 @@ const XLSM_MIME_TYPES = new Set([
  * @param {any} data - Additional data to log (optional).
  * @param {string} level - Log level ("info" or "error").
  */
+const sanitizeForLogging = (value, seen = new WeakSet()) => {
+    if (value instanceof Error) {
+        return {
+            name: value.name,
+            message: value.message,
+            stack: value.stack,
+        };
+    }
+
+    if (typeof value === "string" && value.length > 4000) {
+        return `${value.slice(0, 4000)}...<truncated>`;
+    }
+
+    if (typeof value === "bigint") {
+        return value.toString();
+    }
+
+    if (Array.isArray(value)) {
+        return value.map((item) => sanitizeForLogging(item, seen));
+    }
+
+    if (value && typeof value === "object") {
+        if (seen.has(value)) {
+            return "[Circular]";
+        }
+        seen.add(value);
+
+        const result = {};
+        Object.entries(value).forEach(([key, val]) => {
+            result[key] = sanitizeForLogging(val, seen);
+        });
+        return result;
+    }
+
+    return value;
+};
+
 const log = (message, data = null, level = "info") => {
     const levels = { info: console.log, error: console.error };
-    if (data && data.stack) {
-        // Log stack trace if available
-        levels[level](`${message} \nStack: ${data.stack}`);
-    } else {
-        levels[level](message, data || '');
+    const logger = levels[level] || console.log;
+    const entry = {
+        timestamp: new Date().toISOString(),
+        level,
+        message,
+    };
+
+    if (data !== null && data !== undefined) {
+        entry.data = sanitizeForLogging(data);
     }
+
+    logger(JSON.stringify(entry));
 };
+
+app.use((req, res, next) => {
+    const requestId = req.headers["x-request-id"] || randomUUID();
+    const startTime = Date.now();
+
+    req.requestId = requestId;
+    res.setHeader("x-request-id", requestId);
+
+    log("HTTP request started", {
+        request_id: requestId,
+        method: req.method,
+        path: req.originalUrl || req.url,
+        content_type: req.headers["content-type"],
+        user_agent: req.headers["user-agent"],
+    });
+
+    res.on("finish", () => {
+        log("HTTP request finished", {
+            request_id: requestId,
+            method: req.method,
+            path: req.originalUrl || req.url,
+            status_code: res.statusCode,
+            duration_ms: Date.now() - startTime,
+        });
+    });
+
+    next();
+});
 
 /**
  * Handles errors by logging them and sending a structured error response.
@@ -40,21 +148,27 @@ const log = (message, data = null, level = "info") => {
  * @param {Error} error - The error object.
  * @param {number} statusCode - HTTP status code to send (default: 500).
  */
-const handleError = (response, error, statusCode = 500) => {
-    log("Handling error", error, "error");
+const handleError = (request, response, error) => {
+    const statusCode = error?.statusCode || error?.status || 500;
+    const requestId = request?.requestId;
 
-    let parsedError;
-    try {
-        parsedError = JSON.parse(error.message || error);
-    } catch {
-        parsedError = error.message || error;
-    }
+    log("Handling error", {
+        request_id: requestId,
+        status_code: statusCode,
+        error,
+    }, "error");
 
+    const userMessage = statusCode >= 500
+        ? "An internal error occurred while processing the request"
+        : (error?.message || "Request failed");
+
+    const details = error?.response || error?.details || error?.stack || error?.message || "Unknown error";
     response.status(statusCode).json({
-        message: "An error occurred while processing the request",
+        message: userMessage,
+        request_id: requestId,
         error: {
             status: statusCode,
-            details: parsedError.response || parsedError.stack || parsedError,
+            details,
         },
     });
 };
@@ -294,30 +408,15 @@ const extractXLSMFileFromRequest = (req) => {
         return null;
     }
 
-    const matchesXlsm = (file) => {
-        const fieldName = (file.fieldname || "").toLowerCase();
-        const fileName = (file.originalname || "").toLowerCase();
-        const mimeType = (file.mimetype || "").toLowerCase();
-        const isAttachmentField = fieldName === "file" || fieldName.startsWith("attachment-");
-
-        return (
-            isAttachmentField &&
-            (
-                fileName.endsWith(".xlsm") ||
-                XLSM_MIME_TYPES.has(mimeType)
-            )
-        );
-    };
-
     // Prefer explicit "file" field, then any Mailgun attachment field.
     return (
         files.find((file) =>
             (file.fieldname || "").toLowerCase() === "file" &&
-            matchesXlsm(file)
+            isXLSMAttachment(file)
         ) ||
         files.find((file) =>
             (file.fieldname || "").toLowerCase().startsWith("attachment-") &&
-            matchesXlsm(file)
+            isXLSMAttachment(file)
         ) ||
         null
     );
@@ -327,8 +426,48 @@ const extractXLSMFileFromRequest = (req) => {
  * Handles the `/` POST route for processing uploaded files.
  * Performs file validation, XLSM parsing, data formatting, and submission.
  */
-app.post('/', upload.any(), async (req, res) => {
+app.post('/', (req, res, next) => {
+    upload.any()(req, res, (error) => {
+        if (!error) {
+            return next();
+        }
+
+        if (error instanceof multer.MulterError) {
+            if (error.code === "LIMIT_FILE_SIZE") {
+                const msg = `Attachment too large. Max allowed size is ${MAX_ATTACHMENT_SIZE_MB}MB`;
+                log(msg, { code: error.code }, "error");
+                return res.status(413).json({ message: msg, request_id: req.requestId });
+            }
+
+            const msg = `Upload rejected: ${error.code}`;
+            log(msg, error, "error");
+            return res.status(400).json({ message: msg, request_id: req.requestId });
+        }
+
+        log("Unexpected upload middleware error", error, "error");
+        return res.status(500).json({ message: "Upload middleware failed", request_id: req.requestId });
+    });
+}, async (req, res, next) => {
     try {
+        const contentType = (req.headers["content-type"] || "").toLowerCase();
+        const isMultipart = contentType.includes("multipart/form-data");
+
+        // Mailgun "Send sample POST" can send parsed JSON payload (no multipart attachments).
+        if (!isMultipart) {
+            log("Received non-multipart POST / payload (sample/parsed webhook)", {
+                request_id: req.requestId,
+                headers: {
+                    "content-type": req.headers["content-type"],
+                    "user-agent": req.headers["user-agent"],
+                },
+                body: req.body || {},
+            });
+            return res.status(202).json({
+                message: "Accepted non-multipart payload. No .xlsm attachment to process.",
+                request_id: req.requestId,
+            });
+        }
+
         const inboundFiles = Array.isArray(req.files)
             ? req.files.map(({ fieldname, originalname, mimetype, size }) => ({
                 fieldname,
@@ -338,6 +477,7 @@ app.post('/', upload.any(), async (req, res) => {
             }))
             : [];
         log("Incoming payload on POST /", {
+            request_id: req.requestId,
             headers: {
                 "content-type": req.headers["content-type"],
                 "user-agent": req.headers["user-agent"],
@@ -355,7 +495,7 @@ app.post('/', upload.any(), async (req, res) => {
                 ? `No .xlsm attachment found in Mailgun payload (attachment-count: ${attachmentCount})`
                 : "No .xlsm file attached in the request";
             log(msg, null, "error");
-            return res.status(400).json({ message: msg });
+            return res.status(400).json({ message: msg, request_id: req.requestId });
         }
 
         log("XLSM file received, starting parsing...", {
@@ -373,14 +513,55 @@ app.post('/', upload.any(), async (req, res) => {
         const submitResponse = await postToSubmitRoute(formattedData);
         log("Data submitted successfully to the submit route", submitResponse);
 
-        res.status(200).json(submitResponse);
+        res.status(200).json({
+            ...submitResponse,
+            request_id: req.requestId,
+        });
     } catch (error) {
-        log("Error occurred while processing the request", error, "error");
-        handleError(res, error);
+        next(error);
     }
+});
+
+app.use((req, res) => {
+    res.status(404).json({
+        message: "Route not found",
+        request_id: req.requestId,
+    });
+});
+
+app.use((error, req, res, next) => {
+    if (res.headersSent) {
+        return next(error);
+    }
+    handleError(req, res, error);
 });
 
 // Server Initialization
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => log(`Server running on port ${port}: http://localhost:${port}`));
+const server = app.listen(port, () => {
+    log(`Server running on port ${port}: http://localhost:${port}`);
+});
+
+server.on("error", (error) => {
+    log("Server failed to start or crashed", error, "error");
+    process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+    log("Unhandled promise rejection", { reason }, "error");
+});
+
+process.on("uncaughtException", (error) => {
+    log("Uncaught exception", error, "error");
+    setTimeout(() => process.exit(1), 500).unref();
+});
+
+process.on("SIGTERM", () => {
+    log("SIGTERM received, closing server");
+    server.close(() => {
+        log("HTTP server closed");
+        process.exit(0);
+    });
+    setTimeout(() => process.exit(1), 10000).unref();
+});
