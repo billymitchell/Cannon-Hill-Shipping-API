@@ -1,15 +1,18 @@
-import fs from 'fs';
-import csvParser from 'csv-parser';
 import express from 'express';
 import bodyParser from 'body-parser';
 import multer from 'multer';
-import stream from 'stream';
 import fetch from 'node-fetch';
+import ExcelJS from 'exceljs';
 import 'dotenv/config';
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 app.use(bodyParser.json());
+
+const XLSM_MIME_TYPES = new Set([
+    "application/vnd.ms-excel.sheet.macroenabled.12",
+    "application/octet-stream",
+]);
 
 // Utility Functions
 
@@ -56,53 +59,97 @@ const handleError = (response, error, statusCode = 500) => {
     });
 };
 
-// CSV Parsing and Formatting
+// XLSM Parsing and Formatting
 
 /**
- * Parses a CSV file from a buffer and normalizes the keys.
+ * Normalizes row keys to replace spaces or hyphens with underscores.
+ * @param {object} row - Input row object.
+ * @returns {object} - Row with normalized keys.
+ */
+const normalizeRowKeys = (row) => {
+    const normalizedData = {};
+    Object.keys(row).forEach((key) => {
+        const newKey = key.replace(/[- ]/g, '_').trim();
+        normalizedData[newKey] = row[key];
+    });
+    return normalizedData;
+};
+
+/**
+ * Parses a .xlsm file from a buffer and normalizes the keys.
  * Returns a promise that resolves to an array of parsed objects.
  * @param {Buffer} buffer - The file buffer to parse.
  * @returns {Promise<Array>} - A promise that resolves to an array of parsed data.
  */
-const parseCSVFromBuffer = (buffer) => {
-    return new Promise((resolve, reject) => {
-        const results = [];
-        const readableStream = new stream.Readable();
-        readableStream.push(buffer);
-        readableStream.push(null);
+const parseXLSMFromBuffer = async (buffer) => {
+    try {
+        const workbook = new ExcelJS.Workbook();
+        await workbook.xlsx.load(buffer);
 
-        try {
-            readableStream
-                .pipe(csvParser({ skipLines: 4 }))
-                .on('data', (data) => {
-                    // Normalize keys to replace spaces or hyphens with underscores
-                    const normalizedData = {};
-                    Object.keys(data).forEach((key) => {
-                        const newKey = key.replace(/[- ]/g, '_');
-                        normalizedData[newKey] = data[key];
-                    });
-                    results.push(normalizedData);
-                })
-                .on('end', () => {
-                    log("CSV parsing completed successfully", results);
-                    resolve(results);
-                })
-                .on('error', (error) => {
-                    log("Error during CSV parsing", error, "error");
-                    reject(error);
-                });
-        } catch (error) {
-            // catch synchronous errors in streaming setup (if any)
-            log("Synchronous error during CSV parsing setup", error, "error");
-            reject(error);
+        if (!Array.isArray(workbook.worksheets) || workbook.worksheets.length === 0) {
+            throw new Error("No sheets found in XLSM file");
         }
-    });
+
+        const worksheet = workbook.worksheets[0];
+        const rawRows = [];
+        worksheet.eachRow({ includeEmpty: false }, (row) => {
+            const rowValues = [];
+            for (let i = 1; i <= row.cellCount; i++) {
+                const cell = row.getCell(i);
+                rowValues.push(String(cell?.text || "").trim());
+            }
+            rawRows.push(rowValues);
+        });
+
+        if (rawRows.length === 0) {
+            throw new Error("No rows found in XLSM file");
+        }
+
+        const hasCustPoNumberHeader = (row) =>
+            Array.isArray(row) &&
+            row.some((cell) =>
+                String(cell || "")
+                    .trim()
+                    .toLowerCase()
+                    .replace(/\s+/g, " ")
+                    .includes("cust po number")
+            );
+
+        const headerRowIndex = rawRows.findIndex(hasCustPoNumberHeader);
+        if (headerRowIndex === -1) {
+            throw new Error("Could not find header row containing 'Cust PO Number'");
+        }
+
+        const headers = rawRows[headerRowIndex].map((cell, index) =>
+            String(cell || `column_${index + 1}`).trim()
+        );
+
+        const results = rawRows
+            .slice(headerRowIndex + 1)
+            .filter((row) => Array.isArray(row) && row.some((cell) => String(cell || "").trim() !== ""))
+            .map((row) => {
+                const mappedRow = {};
+                headers.forEach((header, index) => {
+                    mappedRow[header] = row[index] || "";
+                });
+                return normalizeRowKeys(mappedRow);
+            });
+
+        log("XLSM parsing completed successfully", {
+            sheetName: worksheet.name,
+            rowCount: results.length,
+        });
+        return results;
+    } catch (error) {
+        log("Error during XLSM parsing", error, "error");
+        throw error;
+    }
 };
 
 /**
- * Formats parsed CSV data into the required structure for submission.
+ * Formats parsed XLSM data into the required structure for submission.
  * Adds additional error handling per record.
- * @param {Array} results - The parsed CSV data.
+ * @param {Array} results - The parsed XLSM data.
  * @returns {Array} - The formatted data.
  */
 const formatCannonHillData = (results) => {
@@ -231,21 +278,94 @@ const simplifyPostResponses = (postResponses) => {
 };
 
 /**
- * Handles the `/` POST route for processing the uploaded CSV files.
- * Performs file validation, CSV parsing, data formatting, and submission.
+ * Selects a .xlsm file from regular uploads or Mailgun inbound attachments.
+ * Supports:
+ * - Standard multipart field: "file" (must be .xlsm)
+ * - Mailgun inbound fields: "attachment-1", "attachment-2", etc.
+ * @param {object} req - Express request.
+ * @returns {object|null} - A multer file object or null.
  */
-app.post('/', upload.single('file'), async (req, res) => {
+const extractXLSMFileFromRequest = (req) => {
+    const files = Array.isArray(req.files)
+        ? req.files
+        : (req.file ? [req.file] : []);
+
+    if (files.length === 0) {
+        return null;
+    }
+
+    const matchesXlsm = (file) => {
+        const fieldName = (file.fieldname || "").toLowerCase();
+        const fileName = (file.originalname || "").toLowerCase();
+        const mimeType = (file.mimetype || "").toLowerCase();
+        const isAttachmentField = fieldName === "file" || fieldName.startsWith("attachment-");
+
+        return (
+            isAttachmentField &&
+            (
+                fileName.endsWith(".xlsm") ||
+                XLSM_MIME_TYPES.has(mimeType)
+            )
+        );
+    };
+
+    // Prefer explicit "file" field, then any Mailgun attachment field.
+    return (
+        files.find((file) =>
+            (file.fieldname || "").toLowerCase() === "file" &&
+            matchesXlsm(file)
+        ) ||
+        files.find((file) =>
+            (file.fieldname || "").toLowerCase().startsWith("attachment-") &&
+            matchesXlsm(file)
+        ) ||
+        null
+    );
+};
+
+/**
+ * Handles the `/` POST route for processing uploaded files.
+ * Performs file validation, XLSM parsing, data formatting, and submission.
+ */
+app.post('/', upload.any(), async (req, res) => {
     try {
+        const inboundFiles = Array.isArray(req.files)
+            ? req.files.map(({ fieldname, originalname, mimetype, size }) => ({
+                fieldname,
+                originalname,
+                mimetype,
+                size,
+            }))
+            : [];
+        log("Incoming payload on POST /", {
+            headers: {
+                "content-type": req.headers["content-type"],
+                "user-agent": req.headers["user-agent"],
+            },
+            body: req.body || {},
+            files: inboundFiles,
+        });
+
+        const xlsmFile = extractXLSMFileFromRequest(req);
+
         // Confirm file attachment in the request
-        if (!req.file) {
-            const msg = "No file attached in the request";
+        if (!xlsmFile) {
+            const attachmentCount = req.body?.["attachment-count"];
+            const msg = attachmentCount
+                ? `No .xlsm attachment found in Mailgun payload (attachment-count: ${attachmentCount})`
+                : "No .xlsm file attached in the request";
             log(msg, null, "error");
             return res.status(400).json({ message: msg });
         }
 
-        log("File received, starting CSV parsing...");
-        const results = await parseCSVFromBuffer(req.file.buffer);
-        log("CSV parsed, proceeding to data formatting...");
+        log("XLSM file received, starting parsing...", {
+            fieldname: xlsmFile.fieldname,
+            originalname: xlsmFile.originalname,
+            mimetype: xlsmFile.mimetype,
+            size: xlsmFile.size,
+        });
+        const results = await parseXLSMFromBuffer(xlsmFile.buffer);
+        log("XLSM parsed to JSON, proceeding to data formatting...");
 
         const formattedData = formatCannonHillData(results);
         log("Data formatted successfully for submission", formattedData);
