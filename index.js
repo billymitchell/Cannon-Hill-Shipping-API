@@ -199,14 +199,66 @@ const extractXLSMBufferFromMime = (rawMime = "", attachmentMeta = {}) => {
     throw error;
 };
 
-const fetchMailgunAttachment = async (req, attachmentMeta) => {
-    const messageUrl = req.body?.["message-url"];
+const fetchMailgunProtectedResource = async (resourceUrl) => {
+    const response = await fetch(resourceUrl, {
+        headers: {
+            Authorization: `Basic ${Buffer.from(`api:${MAILGUN_API_KEY}`).toString("base64")}`,
+        },
+    });
 
-    if (!messageUrl) {
-        const error = new Error("Mailgun webhook did not include message-url for stored message retrieval");
+    const responseBody = await response.text();
+
+    if (!response.ok) {
+        const error = new Error(`Failed to retrieve Mailgun resource (${response.status})`);
+        error.statusCode = 502;
+        error.response = responseBody;
+        throw error;
+    }
+
+    return responseBody;
+};
+
+const fetchMailgunAttachmentByUrl = async (attachmentMeta = {}) => {
+    const attachmentUrl = attachmentMeta.url;
+
+    if (!attachmentUrl) {
+        const error = new Error("Mailgun attachment metadata did not include a downloadable URL");
         error.statusCode = 400;
         throw error;
     }
+
+    const response = await fetch(attachmentUrl, {
+        headers: {
+            Authorization: `Basic ${Buffer.from(`api:${MAILGUN_API_KEY}`).toString("base64")}`,
+        },
+    });
+
+    if (!response.ok) {
+        const error = new Error(`Failed to retrieve Mailgun attachment (${response.status})`);
+        error.statusCode = 502;
+        error.response = await response.text();
+        throw error;
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+
+    if (buffer.length > MAX_ATTACHMENT_SIZE_BYTES) {
+        const error = new Error(`Attachment too large. Max allowed size is ${MAX_ATTACHMENT_SIZE_MB}MB`);
+        error.statusCode = 413;
+        throw error;
+    }
+
+    return {
+        fieldname: "mailgun-attachment-url",
+        originalname: attachmentMeta.name || "mailgun-attachment.xlsm",
+        mimetype: attachmentMeta["content-type"] || "application/octet-stream",
+        size: buffer.length,
+        buffer,
+    };
+};
+
+const fetchMailgunAttachment = async (req, attachmentMeta) => {
+    const messageUrl = req.body?.["message-url"];
 
     if (!MAILGUN_API_KEY) {
         const error = new Error("MAILGUN_API_KEY is required to download Mailgun-hosted attachments");
@@ -214,20 +266,24 @@ const fetchMailgunAttachment = async (req, attachmentMeta) => {
         throw error;
     }
 
-    const response = await fetch(messageUrl, {
-        headers: {
-            Authorization: `Basic ${Buffer.from(`api:${MAILGUN_API_KEY}`).toString("base64")}`,
-        },
-    });
+    if (attachmentMeta?.url) {
+        try {
+            return await fetchMailgunAttachmentByUrl(attachmentMeta);
+        } catch (error) {
+            log("Direct Mailgun attachment download failed; falling back to stored message retrieval", {
+                attachment_url: attachmentMeta.url,
+                error,
+            }, "error");
+        }
+    }
 
-    if (!response.ok) {
-        const error = new Error(`Failed to retrieve stored Mailgun message (${response.status})`);
-        error.statusCode = 502;
-        error.response = await response.text();
+    if (!messageUrl) {
+        const error = new Error("Mailgun webhook did not include message-url for stored message retrieval");
+        error.statusCode = 400;
         throw error;
     }
 
-    const rawResponse = await response.text();
+    const rawResponse = await fetchMailgunProtectedResource(messageUrl);
     let rawMime = rawResponse;
 
     try {
@@ -687,6 +743,7 @@ app.post('/', (req, res, next) => {
                 originalname: mailgunAttachmentMeta.name,
                 content_type: mailgunAttachmentMeta["content-type"],
                 size: mailgunAttachmentMeta.size,
+                attachment_url: mailgunAttachmentMeta.url,
                 message_url: req.body?.["message-url"],
             });
 
