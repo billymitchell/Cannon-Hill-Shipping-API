@@ -8,6 +8,7 @@ import 'dotenv/config';
 
 const app = express();
 app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
 
 const XLSM_MIME_TYPES = new Set([
     "application/vnd.ms-excel.sheet.macroenabled.12",
