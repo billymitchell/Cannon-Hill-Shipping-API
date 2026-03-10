@@ -20,6 +20,7 @@ const MAX_ATTACHMENT_SIZE_MB = Number.isFinite(parsedMaxAttachmentSizeMb) && par
     ? parsedMaxAttachmentSizeMb
     : 10;
 const MAX_ATTACHMENT_SIZE_BYTES = MAX_ATTACHMENT_SIZE_MB * 1024 * 1024;
+const MAILGUN_API_KEY = process.env.MAILGUN_API_KEY || "";
 
 const isXLSMAttachment = (file = {}) => {
     const fieldName = (file.fieldname || "").toLowerCase();
@@ -34,6 +35,83 @@ const isXLSMAttachment = (file = {}) => {
             XLSM_MIME_TYPES.has(mimeType)
         )
     );
+};
+
+const parseMailgunAttachmentsField = (rawAttachments) => {
+    if (!rawAttachments) {
+        return [];
+    }
+
+    if (Array.isArray(rawAttachments)) {
+        return rawAttachments;
+    }
+
+    if (typeof rawAttachments !== "string") {
+        return [];
+    }
+
+    try {
+        const parsed = JSON.parse(rawAttachments);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+        log("Failed to parse Mailgun attachments metadata", { rawAttachments, error }, "error");
+        return [];
+    }
+};
+
+const extractXLSMMailgunAttachmentMeta = (req) => {
+    const attachments = parseMailgunAttachmentsField(req.body?.attachments);
+
+    return attachments.find((attachment = {}) => {
+        const fileName = String(attachment.name || "").toLowerCase();
+        const mimeType = String(attachment["content-type"] || attachment.contentType || "").toLowerCase();
+
+        return fileName.endsWith(".xlsm") || XLSM_MIME_TYPES.has(mimeType);
+    }) || null;
+};
+
+const fetchMailgunAttachment = async (attachmentMeta) => {
+    if (!attachmentMeta?.url) {
+        const error = new Error("Mailgun attachment metadata did not include a download URL");
+        error.statusCode = 400;
+        throw error;
+    }
+
+    if (!MAILGUN_API_KEY) {
+        const error = new Error("MAILGUN_API_KEY is required to download Mailgun-hosted attachments");
+        error.statusCode = 500;
+        throw error;
+    }
+
+    const response = await fetch(attachmentMeta.url, {
+        headers: {
+            Authorization: `Basic ${Buffer.from(`api:${MAILGUN_API_KEY}`).toString("base64")}`,
+        },
+    });
+
+    if (!response.ok) {
+        const error = new Error(`Failed to download Mailgun attachment (${response.status})`);
+        error.statusCode = 502;
+        error.response = await response.text();
+        throw error;
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    if (buffer.length > MAX_ATTACHMENT_SIZE_BYTES) {
+        const error = new Error(`Attachment too large. Max allowed size is ${MAX_ATTACHMENT_SIZE_MB}MB`);
+        error.statusCode = 413;
+        throw error;
+    }
+
+    return {
+        fieldname: "mailgun-attachment-url",
+        originalname: attachmentMeta.name || "mailgun-attachment.xlsm",
+        mimetype: attachmentMeta["content-type"] || "application/octet-stream",
+        size: buffer.length,
+        buffer,
+    };
 };
 
 const upload = multer({
@@ -453,8 +531,9 @@ app.post('/', (req, res, next) => {
         const contentType = (req.headers["content-type"] || "").toLowerCase();
         const isMultipart = contentType.includes("multipart/form-data");
 
-        // Mailgun "Send sample POST" can send parsed JSON payload (no multipart attachments).
         if (!isMultipart) {
+            const mailgunAttachmentMeta = extractXLSMMailgunAttachmentMeta(req);
+
             log("Received non-multipart POST / payload (sample/parsed webhook)", {
                 request_id: req.requestId,
                 headers: {
@@ -463,8 +542,34 @@ app.post('/', (req, res, next) => {
                 },
                 body: req.body || {},
             });
-            return res.status(202).json({
-                message: "Accepted non-multipart payload. No .xlsm attachment to process.",
+
+            if (!mailgunAttachmentMeta) {
+                return res.status(202).json({
+                    message: "Accepted non-multipart payload. No .xlsm attachment to process.",
+                    request_id: req.requestId,
+                });
+            }
+
+            log("Downloading .xlsm attachment from Mailgun-hosted URL", {
+                request_id: req.requestId,
+                originalname: mailgunAttachmentMeta.name,
+                content_type: mailgunAttachmentMeta["content-type"],
+                size: mailgunAttachmentMeta.size,
+                url: mailgunAttachmentMeta.url,
+            });
+
+            const xlsmFile = await fetchMailgunAttachment(mailgunAttachmentMeta);
+            const results = await parseXLSMFromBuffer(xlsmFile.buffer);
+            log("XLSM parsed to JSON, proceeding to data formatting...");
+
+            const formattedData = formatCannonHillData(results);
+            log("Data formatted successfully for submission", formattedData);
+
+            const submitResponse = await postToSubmitRoute(formattedData);
+            log("Data submitted successfully to the submit route", submitResponse);
+
+            return res.status(200).json({
+                ...submitResponse,
                 request_id: req.requestId,
             });
         }
