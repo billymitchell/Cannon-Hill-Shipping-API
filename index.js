@@ -70,9 +70,140 @@ const extractXLSMMailgunAttachmentMeta = (req) => {
     }) || null;
 };
 
-const fetchMailgunAttachment = async (attachmentMeta) => {
-    if (!attachmentMeta?.url) {
-        const error = new Error("Mailgun attachment metadata did not include a download URL");
+const decodeMimeHeaderValue = (value = "") =>
+    String(value)
+        .replace(/\r?\n[ \t]+/g, " ")
+        .trim()
+        .replace(/^"(.*)"$/, "$1");
+
+const parseMimeHeaders = (rawHeaders = "") => rawHeaders
+    .split(/\r?\n/)
+    .reduce((headers, line) => {
+        if (!line.trim()) {
+            return headers;
+        }
+
+        const separatorIndex = line.indexOf(":");
+        if (separatorIndex === -1) {
+            return headers;
+        }
+
+        const key = line.slice(0, separatorIndex).trim().toLowerCase();
+        const value = decodeMimeHeaderValue(line.slice(separatorIndex + 1));
+        headers[key] = value;
+        return headers;
+    }, {});
+
+const splitMimeParts = (body = "", boundary = "") => {
+    if (!boundary) {
+        return [];
+    }
+
+    const normalizedBoundary = boundary.replace(/^"(.*)"$/, "$1");
+    const segments = body.split(`--${normalizedBoundary}`);
+
+    return segments
+        .slice(1)
+        .map((segment) => segment.replace(/^\r?\n/, "").replace(/\r?\n--\s*$/, "").trim())
+        .filter((segment) => segment && segment !== "--");
+};
+
+const parseMimePart = (rawPart = "") => {
+    const separator = rawPart.indexOf("\r\n\r\n") >= 0 ? "\r\n\r\n" : "\n\n";
+    const separatorIndex = rawPart.indexOf(separator);
+
+    if (separatorIndex === -1) {
+        return { headers: {}, body: rawPart };
+    }
+
+    return {
+        headers: parseMimeHeaders(rawPart.slice(0, separatorIndex)),
+        body: rawPart.slice(separatorIndex + separator.length),
+    };
+};
+
+const extractBoundary = (contentType = "") => {
+    const match = /boundary="?([^";]+)"?/i.exec(contentType);
+    return match?.[1] || null;
+};
+
+const extractMimeFilename = (contentDisposition = "", contentType = "") => {
+    const dispositionMatch = /filename\*?="?([^";]+)"?/i.exec(contentDisposition);
+    if (dispositionMatch?.[1]) {
+        return dispositionMatch[1];
+    }
+
+    const typeMatch = /name="?([^";]+)"?/i.exec(contentType);
+    return typeMatch?.[1] || "";
+};
+
+const decodeMimeBody = (body = "", transferEncoding = "") => {
+    const normalizedEncoding = String(transferEncoding || "").toLowerCase();
+    const normalizedBody = body.replace(/\r?\n/g, "");
+
+    if (normalizedEncoding === "base64") {
+        return Buffer.from(normalizedBody, "base64");
+    }
+
+    return Buffer.from(body, "utf8");
+};
+
+const extractXLSMBufferFromMime = (rawMime = "", attachmentMeta = {}) => {
+    const separator = rawMime.indexOf("\r\n\r\n") >= 0 ? "\r\n\r\n" : "\n\n";
+    const separatorIndex = rawMime.indexOf(separator);
+    if (separatorIndex === -1) {
+        const error = new Error("Stored Mailgun message did not include MIME headers");
+        error.statusCode = 502;
+        throw error;
+    }
+
+    const rootHeaders = parseMimeHeaders(rawMime.slice(0, separatorIndex));
+    const rootBody = rawMime.slice(separatorIndex + separator.length);
+    const boundary = extractBoundary(rootHeaders["content-type"]);
+
+    if (!boundary) {
+        const error = new Error("Stored Mailgun message was not multipart");
+        error.statusCode = 502;
+        throw error;
+    }
+
+    const targetFileName = String(attachmentMeta.name || "").toLowerCase();
+    const parts = splitMimeParts(rootBody, boundary);
+
+    for (const rawPart of parts) {
+        const { headers, body } = parseMimePart(rawPart);
+        const filename = extractMimeFilename(headers["content-disposition"], headers["content-type"]).toLowerCase();
+        const mimetype = String(headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+
+        if (filename === targetFileName || filename.endsWith(".xlsm") || XLSM_MIME_TYPES.has(mimetype)) {
+            const buffer = decodeMimeBody(body, headers["content-transfer-encoding"]);
+
+            if (buffer.length > MAX_ATTACHMENT_SIZE_BYTES) {
+                const error = new Error(`Attachment too large. Max allowed size is ${MAX_ATTACHMENT_SIZE_MB}MB`);
+                error.statusCode = 413;
+                throw error;
+            }
+
+            return {
+                fieldname: "mailgun-message-url",
+                originalname: filename || attachmentMeta.name || "mailgun-attachment.xlsm",
+                mimetype: mimetype || attachmentMeta["content-type"] || "application/octet-stream",
+                size: buffer.length,
+                buffer,
+            };
+        }
+    }
+
+    const error = new Error("No .xlsm attachment found in stored Mailgun message");
+    error.statusCode = 502;
+    throw error;
+};
+
+const fetchMailgunAttachment = async (req, attachmentMeta) => {
+    const messageUrl = req.body?.["message-url"];
+
+    if (!messageUrl) {
+        const error = new Error("Mailgun webhook did not include message-url for stored message retrieval");
         error.statusCode = 400;
         throw error;
     }
@@ -83,35 +214,36 @@ const fetchMailgunAttachment = async (attachmentMeta) => {
         throw error;
     }
 
-    const response = await fetch(attachmentMeta.url, {
+    const response = await fetch(messageUrl, {
         headers: {
             Authorization: `Basic ${Buffer.from(`api:${MAILGUN_API_KEY}`).toString("base64")}`,
         },
     });
 
     if (!response.ok) {
-        const error = new Error(`Failed to download Mailgun attachment (${response.status})`);
+        const error = new Error(`Failed to retrieve stored Mailgun message (${response.status})`);
         error.statusCode = 502;
         error.response = await response.text();
         throw error;
     }
 
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+    const rawResponse = await response.text();
+    let rawMime = rawResponse;
 
-    if (buffer.length > MAX_ATTACHMENT_SIZE_BYTES) {
-        const error = new Error(`Attachment too large. Max allowed size is ${MAX_ATTACHMENT_SIZE_MB}MB`);
-        error.statusCode = 413;
+    try {
+        const parsedResponse = JSON.parse(rawResponse);
+        rawMime = parsedResponse["body-mime"] || parsedResponse["message"] || "";
+    } catch (error) {
+        // The endpoint can also return a raw MIME message body.
+    }
+
+    if (!rawMime) {
+        const error = new Error("Stored Mailgun message response did not contain a MIME payload");
+        error.statusCode = 502;
         throw error;
     }
 
-    return {
-        fieldname: "mailgun-attachment-url",
-        originalname: attachmentMeta.name || "mailgun-attachment.xlsm",
-        mimetype: attachmentMeta["content-type"] || "application/octet-stream",
-        size: buffer.length,
-        buffer,
-    };
+    return extractXLSMBufferFromMime(rawMime, attachmentMeta);
 };
 
 const upload = multer({
@@ -550,15 +682,15 @@ app.post('/', (req, res, next) => {
                 });
             }
 
-            log("Downloading .xlsm attachment from Mailgun-hosted URL", {
+            log("Retrieving stored Mailgun message for .xlsm attachment", {
                 request_id: req.requestId,
                 originalname: mailgunAttachmentMeta.name,
                 content_type: mailgunAttachmentMeta["content-type"],
                 size: mailgunAttachmentMeta.size,
-                url: mailgunAttachmentMeta.url,
+                message_url: req.body?.["message-url"],
             });
 
-            const xlsmFile = await fetchMailgunAttachment(mailgunAttachmentMeta);
+            const xlsmFile = await fetchMailgunAttachment(req, mailgunAttachmentMeta);
             const results = await parseXLSMFromBuffer(xlsmFile.buffer);
             log("XLSM parsed to JSON, proceeding to data formatting...");
 
