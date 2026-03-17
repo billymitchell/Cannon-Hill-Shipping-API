@@ -21,6 +21,9 @@ const MAX_ATTACHMENT_SIZE_MB = Number.isFinite(parsedMaxAttachmentSizeMb) && par
     : 10;
 const MAX_ATTACHMENT_SIZE_BYTES = MAX_ATTACHMENT_SIZE_MB * 1024 * 1024;
 const MAILGUN_API_KEY = process.env.MAILGUN_API_KEY || "";
+const MAILGUN_FETCH_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const isXLSMAttachment = (file = {}) => {
     const fieldName = (file.fieldname || "").toLowerCase();
@@ -242,7 +245,7 @@ const buildMailgunMessageResourceUrls = (req) => {
     }
 
     if (pathFromOriginalUrl && domain) {
-        for (const host of ["api.mailgun.net", "api.us.mailgun.net"]) {
+        for (const host of ["api.mailgun.net", "api.eu.mailgun.net"]) {
             for (const path of paths) {
                 urls.add(`https://${host}${path}`);
             }
@@ -266,7 +269,7 @@ const buildMailgunAttachmentUrls = (req, attachmentMeta = {}) => {
 
     if (domain && messagePath && attachmentIndexMatch?.[1]) {
         const attachmentPath = `${messagePath}/attachments/${attachmentIndexMatch[1]}`;
-        for (const host of ["api.mailgun.net", "api.us.mailgun.net"]) {
+        for (const host of ["api.mailgun.net", "api.eu.mailgun.net"]) {
             attachmentUrls.add(`https://${host}${attachmentPath}`);
         }
     }
@@ -278,6 +281,7 @@ const fetchMailgunProtectedResource = async (resourceUrl) => {
     const response = await fetch(resourceUrl, {
         headers: {
             Authorization: `Basic ${Buffer.from(`api:${MAILGUN_API_KEY}`).toString("base64")}`,
+            Accept: "message/rfc2822, application/json;q=0.9, */*;q=0.1",
         },
     });
 
@@ -293,12 +297,39 @@ const fetchMailgunProtectedResource = async (resourceUrl) => {
     return responseBody;
 };
 
+const fetchMailgunProtectedResourceWithRetry = async (resourceUrl) => {
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= MAILGUN_FETCH_RETRY_DELAYS_MS.length; attempt += 1) {
+        try {
+            return await fetchMailgunProtectedResource(resourceUrl);
+        } catch (error) {
+            lastError = error;
+            const isRetriable404 = error?.message?.includes("(404)");
+
+            if (!isRetriable404 || attempt === MAILGUN_FETCH_RETRY_DELAYS_MS.length) {
+                throw error;
+            }
+
+            const retryDelayMs = MAILGUN_FETCH_RETRY_DELAYS_MS[attempt];
+            log("Mailgun protected resource not ready yet; retrying", {
+                resource_url: resourceUrl,
+                retry_delay_ms: retryDelayMs,
+                attempt: attempt + 1,
+            }, "info");
+            await sleep(retryDelayMs);
+        }
+    }
+
+    throw lastError || new Error("Failed to retrieve Mailgun resource");
+};
+
 const fetchFirstSuccessfulMailgunResource = async (resourceUrls = []) => {
     let lastError = null;
 
     for (const resourceUrl of resourceUrls) {
         try {
-            return await fetchMailgunProtectedResource(resourceUrl);
+            return await fetchMailgunProtectedResourceWithRetry(resourceUrl);
         } catch (error) {
             lastError = error;
             log("Mailgun protected resource retrieval attempt failed", {
@@ -348,6 +379,33 @@ const fetchMailgunAttachmentByUrl = async (attachmentUrl, attachmentMeta = {}) =
     };
 };
 
+const fetchMailgunAttachmentByUrlWithRetry = async (attachmentUrl, attachmentMeta = {}) => {
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= MAILGUN_FETCH_RETRY_DELAYS_MS.length; attempt += 1) {
+        try {
+            return await fetchMailgunAttachmentByUrl(attachmentUrl, attachmentMeta);
+        } catch (error) {
+            lastError = error;
+            const isRetriable404 = error?.message?.includes("(404)");
+
+            if (!isRetriable404 || attempt === MAILGUN_FETCH_RETRY_DELAYS_MS.length) {
+                throw error;
+            }
+
+            const retryDelayMs = MAILGUN_FETCH_RETRY_DELAYS_MS[attempt];
+            log("Mailgun attachment not ready yet; retrying", {
+                attachment_url: attachmentUrl,
+                retry_delay_ms: retryDelayMs,
+                attempt: attempt + 1,
+            }, "info");
+            await sleep(retryDelayMs);
+        }
+    }
+
+    throw lastError || new Error("Failed to retrieve Mailgun attachment");
+};
+
 const fetchMailgunAttachment = async (req, attachmentMeta) => {
     if (!MAILGUN_API_KEY) {
         const error = new Error("MAILGUN_API_KEY is required to download Mailgun-hosted attachments");
@@ -364,7 +422,7 @@ const fetchMailgunAttachment = async (req, attachmentMeta) => {
     if (attachmentUrls.length > 0) {
         for (const attachmentUrl of attachmentUrls) {
             try {
-                return await fetchMailgunAttachmentByUrl(attachmentUrl, attachmentMeta);
+                return await fetchMailgunAttachmentByUrlWithRetry(attachmentUrl, attachmentMeta);
             } catch (error) {
                 log("Direct Mailgun attachment download failed; trying next retrieval option", {
                     attachment_url: attachmentUrl,
