@@ -199,6 +199,81 @@ const extractXLSMBufferFromMime = (rawMime = "", attachmentMeta = {}) => {
     throw error;
 };
 
+const extractMailgunMessagePath = (messageUrl = "") => {
+    if (!messageUrl) {
+        return "";
+    }
+
+    try {
+        const url = new URL(messageUrl);
+        const match = url.pathname.match(/\/v3\/domains\/[^/]+\/messages\/.+$/);
+        return match?.[0] || "";
+    } catch (error) {
+        return "";
+    }
+};
+
+const buildMailgunMessageResourceUrls = (req) => {
+    const originalMessageUrl = req.body?.["message-url"] || "";
+    const domain = req.body?.domain || "";
+    const pathFromOriginalUrl = extractMailgunMessagePath(originalMessageUrl);
+
+    if (!pathFromOriginalUrl && !originalMessageUrl) {
+        return [];
+    }
+
+    const paths = new Set();
+
+    if (pathFromOriginalUrl) {
+        paths.add(pathFromOriginalUrl);
+        paths.add(`${pathFromOriginalUrl}/mime`);
+    }
+
+    if (originalMessageUrl && !pathFromOriginalUrl) {
+        paths.add(originalMessageUrl);
+        paths.add(`${originalMessageUrl}/mime`);
+    }
+
+    const urls = new Set();
+
+    if (originalMessageUrl) {
+        urls.add(originalMessageUrl);
+        urls.add(`${originalMessageUrl}/mime`);
+    }
+
+    if (pathFromOriginalUrl && domain) {
+        for (const host of ["api.mailgun.net", "api.us.mailgun.net"]) {
+            for (const path of paths) {
+                urls.add(`https://${host}${path}`);
+            }
+        }
+    }
+
+    return Array.from(urls).filter(Boolean);
+};
+
+const buildMailgunAttachmentUrls = (req, attachmentMeta = {}) => {
+    const attachmentUrls = new Set();
+    const originalAttachmentUrl = attachmentMeta.url || "";
+
+    if (originalAttachmentUrl) {
+        attachmentUrls.add(originalAttachmentUrl);
+    }
+
+    const domain = req.body?.domain || "";
+    const messagePath = extractMailgunMessagePath(req.body?.["message-url"] || "");
+    const attachmentIndexMatch = String(originalAttachmentUrl).match(/\/attachments\/(\d+)(?:$|[/?#])/i);
+
+    if (domain && messagePath && attachmentIndexMatch?.[1]) {
+        const attachmentPath = `${messagePath}/attachments/${attachmentIndexMatch[1]}`;
+        for (const host of ["api.mailgun.net", "api.us.mailgun.net"]) {
+            attachmentUrls.add(`https://${host}${attachmentPath}`);
+        }
+    }
+
+    return Array.from(attachmentUrls).filter(Boolean);
+};
+
 const fetchMailgunProtectedResource = async (resourceUrl) => {
     const response = await fetch(resourceUrl, {
         headers: {
@@ -218,9 +293,25 @@ const fetchMailgunProtectedResource = async (resourceUrl) => {
     return responseBody;
 };
 
-const fetchMailgunAttachmentByUrl = async (attachmentMeta = {}) => {
-    const attachmentUrl = attachmentMeta.url;
+const fetchFirstSuccessfulMailgunResource = async (resourceUrls = []) => {
+    let lastError = null;
 
+    for (const resourceUrl of resourceUrls) {
+        try {
+            return await fetchMailgunProtectedResource(resourceUrl);
+        } catch (error) {
+            lastError = error;
+            log("Mailgun protected resource retrieval attempt failed", {
+                resource_url: resourceUrl,
+                error,
+            }, "error");
+        }
+    }
+
+    throw lastError || new Error("Failed to retrieve Mailgun resource");
+};
+
+const fetchMailgunAttachmentByUrl = async (attachmentUrl, attachmentMeta = {}) => {
     if (!attachmentUrl) {
         const error = new Error("Mailgun attachment metadata did not include a downloadable URL");
         error.statusCode = 400;
@@ -258,32 +349,39 @@ const fetchMailgunAttachmentByUrl = async (attachmentMeta = {}) => {
 };
 
 const fetchMailgunAttachment = async (req, attachmentMeta) => {
-    const messageUrl = req.body?.["message-url"];
-
     if (!MAILGUN_API_KEY) {
         const error = new Error("MAILGUN_API_KEY is required to download Mailgun-hosted attachments");
         error.statusCode = 500;
         throw error;
     }
 
-    if (attachmentMeta?.url) {
-        try {
-            return await fetchMailgunAttachmentByUrl(attachmentMeta);
-        } catch (error) {
-            log("Direct Mailgun attachment download failed; falling back to stored message retrieval", {
-                attachment_url: attachmentMeta.url,
-                error,
-            }, "error");
+    const rawMimeFromWebhook = req.body?.["body-mime"] || req.body?.["mime"] || "";
+    if (rawMimeFromWebhook) {
+        return extractXLSMBufferFromMime(rawMimeFromWebhook, attachmentMeta);
+    }
+
+    const attachmentUrls = buildMailgunAttachmentUrls(req, attachmentMeta);
+    if (attachmentUrls.length > 0) {
+        for (const attachmentUrl of attachmentUrls) {
+            try {
+                return await fetchMailgunAttachmentByUrl(attachmentUrl, attachmentMeta);
+            } catch (error) {
+                log("Direct Mailgun attachment download failed; trying next retrieval option", {
+                    attachment_url: attachmentUrl,
+                    error,
+                }, "error");
+            }
         }
     }
 
-    if (!messageUrl) {
+    const messageUrls = buildMailgunMessageResourceUrls(req);
+    if (messageUrls.length === 0) {
         const error = new Error("Mailgun webhook did not include message-url for stored message retrieval");
         error.statusCode = 400;
         throw error;
     }
 
-    const rawResponse = await fetchMailgunProtectedResource(messageUrl);
+    const rawResponse = await fetchFirstSuccessfulMailgunResource(messageUrls);
     let rawMime = rawResponse;
 
     try {
