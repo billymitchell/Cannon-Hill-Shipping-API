@@ -849,7 +849,7 @@ const extractXLSMFileFromRequest = (req) => {
  * Handles the `/` POST route for processing uploaded files.
  * Performs file validation, XLSM parsing, data formatting, and submission.
  */
-app.post('/', (req, res, next) => {
+app.post(['/', '/mime', '/raw-mime'], (req, res, next) => {
     upload.any()(req, res, (error) => {
         if (!error) {
             return next();
