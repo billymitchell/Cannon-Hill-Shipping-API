@@ -8,28 +8,41 @@ This project is an API designed to process shipping orders for multiple stores u
 2. **XLSM Parsing**: The uploaded workbook is parsed and converted to JSON rows. The header row is auto-detected by finding the row containing `Cust PO Number`, then keys are normalized (spaces/hyphens replaced with underscores).
 3. **Data Formatting**: The parsed JSON data is formatted to match the requirements of the target system. Store/customer IDs and shipment methods are mapped to specific codes. Only unique order IDs are processed.
 4. **Submission to Remote API**: The formatted data is sent to a remote API endpoint (`https://orderdesk-single-order-ship-65ffd8ceba36.herokuapp.com/`) via POST, with retry logic and exponential backoff for reliability.
-5. **Response Handling**: The response from the remote API is simplified and returned to the client. Errors are logged and returned in a structured format.
-6. **Logging & Error Handling**: All major steps and errors are logged for debugging. Errors are handled gracefully and returned as JSON.
+5. **Response Handling**: The response from the remote API is simplified and returned with a processing summary. Queued asynchronous submissions are reported as `queued`, not as errors.
+6. **Logging & Error Handling**: Logs contain concise processing events, counts, and safe row-level rejection diagnostics. Webhook secrets, email bodies, addresses, tracking numbers, and complete shipment payloads are not logged. Row diagnostics are capped at 50 per spreadsheet to keep logs bounded.
 
 **Summary:**
 You upload a shipping `.xlsm` file, the server converts it to JSON, formats the data, then submits it to a remote order processing API and returns the results. The application is designed for reliability, with detailed logging and error handling throughout.
 
 ## Project Structure
 
-- **index.js**:  
-  Main Express server, handles file upload, XLSM parsing, data formatting, submission, and error handling.
+- **index.js**:
+  Small Express server bootstrap, health endpoint, and process lifecycle handling.
 
-- **routes/**:  
-  *(Not used in the current implementation, but referenced for future modularization.)*
-  - **cannonHill.js**: Handles routes specific to Cannon Hill.  
-  - **submit.js**: Manages order submissions including processing GET/POST requests to Orderdesk's API.
+- **src/config.js**:
+  Runtime configuration and environment-variable defaults.
+
+- **src/logger.js** and **src/http.js**:
+  Redacted structured logging, request IDs, and HTTP error handling.
+
+- **src/mailgun.js**:
+  Mailgun attachment intake, stored-message retrieval, MIME parsing, and upload validation.
+
+- **src/spreadsheet.js**:
+  XLSM parsing, shipment formatting, processing summaries, and safe row diagnostics.
+
+- **src/submit.js** and **src/shipment-service.js**:
+  Downstream submission and orchestration of the complete shipment workflow.
+
+- **src/routes.js**:
+  Direct-upload and Mailgun POST routes.
 
 - **uploads/**:  
   *(Not used in the current implementation, as files are processed in memory.)*
   Directory where uploaded files (such as XLSM files) would be stored if needed.
 
 - **.env**:  
-  Holds environment variables like store API keys (e.g., `STORE_21633`, `STORE_40348`, etc.).
+  Holds runtime configuration such as `PORT`, `MAX_ATTACHMENT_SIZE_MB`, `MAILGUN_API_KEY`, and the optional `SUBMIT_ROUTE` override.
 
 - **package.json**:  
   Defines project metadata and dependencies including:
@@ -61,4 +74,5 @@ You upload a shipping `.xlsm` file, the server converts it to JSON, formats the 
 ## Notes
 - All processing is done in memory; no files are saved to disk.
 - The application is designed for reliability, with retry logic and detailed error handling.
+- Rows with unknown customer numbers are rejected instead of being submitted with an invalid store ID.
 - For more details, see the code in `index.js`.
