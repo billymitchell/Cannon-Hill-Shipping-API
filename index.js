@@ -564,6 +564,14 @@ app.use((req, res, next) => {
     next();
 });
 
+app.get('/', (req, res) => {
+    res.status(200).json({
+        status: "ok",
+        service: "cannon-hill-shipment-api",
+        request_id: req.requestId,
+    });
+});
+
 /**
  * Handles errors by logging them and sending a structured error response.
  * Includes more details for debugging.
