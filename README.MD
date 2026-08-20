@@ -1,23 +1,31 @@
 # Orderdesk CAWLEY CANNON HILL Shipping API
 
-This project is an API designed to process shipping orders for multiple stores using [Express](https://expressjs.com). It leverages environment variables to securely store API keys for each store.
+This project is a shipping-processing service built with [Express](https://expressjs.com). It provides both:
+
+- a browser landing page for manual `.xlsm` uploads and report viewing
+- API endpoints for direct uploads and Mailgun webhook-driven processing
+
+It leverages environment variables to securely store runtime configuration and API keys.
 
 ## How It Works
 
-1. **File Upload**: The API exposes a POST endpoint at `/` that accepts `.xlsm` uploads (using Multer in memory).
+1. **Upload Intake**: A landing page at `GET /` lets users upload `.xlsm` files from the browser. API clients can send direct multipart uploads to `POST /upload` (or `POST /` for backward compatibility).
 2. **XLSM Parsing**: The uploaded workbook is parsed and converted to JSON rows. The header row is auto-detected by finding the row containing `Cust PO Number`, then keys are normalized (spaces/hyphens replaced with underscores).
 3. **Data Formatting**: The parsed JSON data is formatted to match the requirements of the target system. Store/customer IDs and shipment methods are mapped to specific codes. Only unique order IDs are processed.
 4. **Submission to Remote API**: The formatted data is sent to a remote API endpoint (`https://orderdesk-single-order-ship-65ffd8ceba36.herokuapp.com/`) via POST, with retry logic and exponential backoff for reliability.
-5. **Response Handling**: The response from the remote API is simplified and returned with a processing summary. Queued asynchronous submissions are reported as `queued`, not as errors.
+5. **Response Handling & User Report**: The response from the remote API is simplified and returned with a processing summary and row diagnostics. The landing page renders this report for users after each upload.
 6. **Logging & Error Handling**: Logs contain concise processing events, counts, and safe row-level rejection diagnostics. Webhook secrets, email bodies, addresses, tracking numbers, and complete shipment payloads are not logged. Row diagnostics are capped at 50 per spreadsheet to keep logs bounded.
 
 **Summary:**
-You upload a shipping `.xlsm` file, the server converts it to JSON, formats the data, then submits it to a remote order processing API and returns the results. The application is designed for reliability, with detailed logging and error handling throughout.
+You upload a shipping `.xlsm` file (via UI or API), the server converts it to JSON, formats the data, submits it to a remote order processing API, and returns a structured result (summary + diagnostics). The application is designed for reliability, with detailed logging and error handling throughout.
 
 ## Project Structure
 
 - **index.js**:
-  Small Express server bootstrap, health endpoint, and process lifecycle handling.
+  Express bootstrap, static-file hosting for the landing page, health endpoint, and process lifecycle handling.
+
+- **public/**:
+  Browser UI assets for the landing page upload form and result report rendering.
 
 - **src/config.js**:
   Runtime configuration and environment-variable defaults.
@@ -35,7 +43,7 @@ You upload a shipping `.xlsm` file, the server converts it to JSON, formats the 
   Downstream submission and orchestration of the complete shipment workflow.
 
 - **src/routes.js**:
-  Direct-upload and Mailgun POST routes.
+  Direct-upload and Mailgun POST routes (`/`, `/upload`, `/mime`, `/raw-mime`).
 
 - **uploads/**:  
   *(Not used in the current implementation, as files are processed in memory.)*
@@ -67,12 +75,38 @@ You upload a shipping `.xlsm` file, the server converts it to JSON, formats the 
    ```
 
 3. **Usage:**
-   - Send a POST request to `http://localhost:3000/` with a form-data field named `file` containing your `.xlsm` file.
-   - Mailgun inbound webhook posts are also supported. The API accepts multipart attachment fields like `attachment-1`, `attachment-2`, etc., ignores non-`.xlsm` attachments, and processes only the `.xlsm` attachment.
-   - The server will process the file and return a JSON response with the results.
+
+### Landing Page (Manual Upload)
+
+- Open `http://localhost:3000/` in a browser.
+- Select an `.xlsm` attachment and click **Process Attachment**.
+- After processing, the page displays a report including request ID, shipment summary, and row diagnostics.
+
+### API Endpoints
+
+- `GET /`  
+  Serves the landing page UI.
+
+- `GET /health`  
+  Returns JSON health status.
+
+- `POST /upload`  
+  Direct multipart upload endpoint for `.xlsm` files (form-data field: `file`).
+
+- `POST /`  
+  Backward-compatible direct upload endpoint and Mailgun-compatible intake path.
+
+- `POST /mime` and `POST /raw-mime`  
+  Mailgun-compatible webhook paths.
+
+### Mailgun Webhook Notes
+
+- Inbound Mailgun webhook posts are supported.
+- The API accepts multipart attachment fields like `attachment-1`, `attachment-2`, etc.
+- Non-`.xlsm` attachments are ignored; only `.xlsm` is processed.
 
 ## Notes
 - All processing is done in memory; no files are saved to disk.
 - The application is designed for reliability, with retry logic and detailed error handling.
 - Rows with unknown customer numbers are rejected instead of being submitted with an invalid store ID.
-- For more details, see the code in `index.js`.
+- For more details, see `index.js` and `src/routes.js`.

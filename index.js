@@ -1,17 +1,22 @@
 import express from 'express';
 import bodyParser from 'body-parser';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { PORT } from './src/config.js';
 import { handleError, requestLogger } from './src/http.js';
 import { log } from './src/logger.js';
 import { shipmentRouter } from './src/routes.js';
 
 const app = express();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(requestLogger);
+app.use(express.static(path.join(__dirname, 'public')));
 
-app.get('/', (req, res) => {
+app.get('/health', (req, res) => {
     res.status(200).json({
         status: "ok",
         service: "cannon-hill-shipment-api",

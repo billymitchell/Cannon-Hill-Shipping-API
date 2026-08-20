@@ -13,7 +13,7 @@ import { processShipmentFile } from './shipment-service.js';
 
 export const shipmentRouter = Router();
 
-shipmentRouter.post(['/', '/mime', '/raw-mime'], (req, res, next) => {
+shipmentRouter.post(['/', '/upload', '/mime', '/raw-mime'], (req, res, next) => {
     upload.any()(req, res, (error) => {
         if (!error) {
             return next();

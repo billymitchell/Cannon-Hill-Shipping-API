@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cannon Hill Shipping Processor</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+        href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+        rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+</head>
+
+<body>
+    <div class="background-grid" aria-hidden="true"></div>
+    <main class="container">
+        <header class="hero">
+            <p class="eyebrow">Cannon Hill</p>
+            <h1>Shipping File Intake</h1>
+            <p class="lead">Upload your XLSM attachment and get a clear shipment processing report instantly.</p>
+        </header>
+
+        <section class="panel">
+            <form id="upload-form" class="upload-form" novalidate>
+                <label for="file" class="label">Attachment (.xlsm)</label>
+                <input id="file" name="file" type="file" accept=".xlsm,application/vnd.ms-excel.sheet.macroEnabled.12"
+                    required />
+                <button id="submit-button" type="submit">Process Attachment</button>
+            </form>
+            <p id="status" class="status" aria-live="polite"></p>
+        </section>
+
+        <section id="report" class="panel report hidden" aria-live="polite"></section>
+    </main>
+
+    <script src="/app.js" defer></script>
+</body>
+
+</html>
