@@ -1,6 +1,41 @@
 import fetch from 'node-fetch';
-import { SUBMIT_ROUTE } from './config.js';
+import { createHash } from 'crypto';
+import { SUBMIT_API_KEY, SUBMIT_ROUTE } from './config.js';
 import { log } from './logger.js';
+
+export const buildIdempotencyKey = (data) =>
+    `cannon-hill-${createHash("sha256")
+        .update(JSON.stringify(data))
+        .digest("hex")}`;
+
+export const buildSubmitHeaders = (data) => {
+    const headers = {
+        "Content-Type": "application/json",
+        "Idempotency-Key": buildIdempotencyKey(data),
+    };
+    if (SUBMIT_API_KEY) {
+        headers["X-API-Key"] = SUBMIT_API_KEY;
+    }
+    return headers;
+};
+
+const parseJsonResponse = (rawResponse) => {
+    if (!rawResponse) {
+        return {};
+    }
+
+    try {
+        return JSON.parse(rawResponse);
+    } catch (error) {
+        const parseError = new Error("Downstream API returned invalid JSON");
+        parseError.statusCode = 502;
+        parseError.retriable = true;
+        throw parseError;
+    }
+};
+
+const isRetriableStatus = (status) =>
+    status === 408 || status === 429 || status >= 500;
 
 const simplifyPostResponses = (postResponses) => {
     if (!Array.isArray(postResponses) || postResponses.length === 0) {
@@ -43,23 +78,28 @@ export const postToSubmitRoute = async (
     for (let attempt = 1; attempt <= retries; attempt += 1) {
         try {
             const attemptStartedAt = Date.now();
+            const headers = buildSubmitHeaders(data);
+
             const response = await fetch(SUBMIT_ROUTE, {
                 method: 'POST',
-                headers: { "Content-Type": "application/json" },
+                headers,
                 body: JSON.stringify(data),
             });
             const rawResponse = await response.text();
+            const jsonResponse = parseJsonResponse(rawResponse);
 
             if (!response.ok) {
                 const error = new Error(
+                    jsonResponse.message ||
                     `Downstream submission failed with status ${response.status}`
                 );
                 error.statusCode = 502;
                 error.downstreamStatus = response.status;
+                error.downstreamErrors = jsonResponse.errors;
+                error.retriable = isRetriableStatus(response.status);
                 throw error;
             }
 
-            const jsonResponse = JSON.parse(rawResponse);
             const responseMessage =
                 jsonResponse.message || "Shipment batch accepted";
             const isQueued =
@@ -93,9 +133,15 @@ export const postToSubmitRoute = async (
                 message: responseMessage,
                 execution_time: jsonResponse.execution_time || "N/A",
                 results: simplifiedResults,
+                batch_id: jsonResponse.batch_id || null,
+                shipment_count:
+                    jsonResponse.shipment_count ?? data.length,
+                status_url: jsonResponse.status_url || null,
+                replayed: jsonResponse.replayed === true,
             };
         } catch (error) {
-            const isFinalAttempt = attempt === retries;
+            const isFinalAttempt =
+                attempt === retries || error.retriable === false;
             log(
                 isFinalAttempt
                     ? "Shipment batch submission failed"

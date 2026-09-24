@@ -12,8 +12,8 @@ It leverages environment variables to securely store runtime configuration and A
 1. **Upload Intake**: A landing page at `GET /` lets users upload `.xlsm` files from the browser. API clients can send direct multipart uploads to `POST /upload` (or `POST /` for backward compatibility).
 2. **XLSM Parsing**: The uploaded workbook is parsed and converted to JSON rows. The header row is auto-detected by finding the row containing `Cust PO Number`, then keys are normalized (spaces/hyphens replaced with underscores).
 3. **Data Formatting**: The parsed JSON data is formatted to match the requirements of the target system. Store/customer IDs and shipment methods are mapped to specific codes. Only unique order IDs are processed.
-4. **Submission to Remote API**: The formatted data is sent to a remote API endpoint (`https://orderdesk-single-order-ship-65ffd8ceba36.herokuapp.com/`) via POST, with retry logic and exponential backoff for reliability.
-5. **Response Handling & User Report**: The response from the remote API is simplified and returned with a processing summary and row diagnostics. The landing page renders this report for users after each upload.
+4. **Submission to Remote API**: The formatted data is sent as a JSON array to the remote API endpoint (`https://orderdesk-single-order-ship-65ffd8ceba36.herokuapp.com/`) via `POST /`. Every request includes a stable content-based `Idempotency-Key`; `X-API-Key` is also included when `SUBMIT_API_KEY` is configured.
+5. **Response Handling & User Report**: A `202 Accepted` response means the shipment batch was durably queued, not that every Order Desk shipment has completed. The returned `batch_id`, `status_url`, queue status, processing summary, and row diagnostics are passed back to the caller and rendered by the landing page.
 6. **Logging & Error Handling**: Logs contain concise processing events, counts, and safe row-level rejection diagnostics. Webhook secrets, email bodies, addresses, tracking numbers, and complete shipment payloads are not logged. Row diagnostics are capped at 50 per spreadsheet to keep logs bounded.
 
 **Summary:**
@@ -50,7 +50,7 @@ You upload a shipping `.xlsm` file (via UI or API), the server converts it to JS
   Directory where uploaded files (such as XLSM files) would be stored if needed.
 
 - **.env**:  
-  Holds runtime configuration such as `PORT`, `MAX_ATTACHMENT_SIZE_MB`, `MAILGUN_API_KEY`, and the optional `SUBMIT_ROUTE` override.
+  Holds runtime configuration such as `PORT`, `MAX_ATTACHMENT_SIZE_MB`, `MAILGUN_API_KEY`, the optional `SUBMIT_ROUTE` override, and `SUBMIT_API_KEY` for an authenticated downstream API.
 
 - **package.json**:  
   Defines project metadata and dependencies including:
@@ -104,6 +104,28 @@ You upload a shipping `.xlsm` file (via UI or API), the server converts it to JS
 - Inbound Mailgun webhook posts are supported.
 - The API accepts multipart attachment fields like `attachment-1`, `attachment-2`, etc.
 - Non-`.xlsm` attachments are ignored; only `.xlsm` is processed.
+
+### Downstream Submission Contract
+
+The service submits all accepted spreadsheet rows in one JSON array. Each shipment contains:
+
+```json
+{
+  "source_id": "68125-123456",
+  "tracking_number": "1Z999AA10123456784",
+  "carrier_code": "ups",
+  "shipment_method": "Ground"
+}
+```
+
+Configure the protected downstream API with:
+
+```env
+SUBMIT_ROUTE=https://your-orderdesk-shipping-api.example.com/
+SUBMIT_API_KEY=your-inbound-api-key
+```
+
+The downstream API validates the entire array atomically. Invalid store IDs, missing required values, or unsupported carrier codes cause the complete request to be rejected. Retriable responses (`408`, `429`, and `5xx`) use the same idempotency key on every attempt so an uncertain retry cannot create a second batch.
 
 ## Notes
 - All processing is done in memory; no files are saved to disk.

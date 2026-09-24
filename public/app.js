@@ -68,6 +68,9 @@ const renderReport = (payload, isError = false) => {
   reportEl.innerHTML = `
     <h2>${isError ? "Processing Error" : "Processing Complete"}</h2>
     <p><strong>Request ID:</strong> ${escapeHtml(payload?.request_id || "n/a")}</p>
+    ${payload?.batch_id ? `<p><strong>Downstream Batch ID:</strong> ${escapeHtml(payload.batch_id)}</p>` : ""}
+    ${payload?.status_url ? `<p><strong>Status URL:</strong> ${escapeHtml(payload.status_url)}</p>` : ""}
+    ${payload?.replayed ? "<p>This shipment batch was already queued; the existing batch was returned.</p>" : ""}
     <div class="kpis">
       ${renderKpi("Shipments Accepted", summary.shipments_accepted ?? 0)}
       ${renderKpi("Rows Skipped", summary.rows_skipped ?? 0)}

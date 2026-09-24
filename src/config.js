@@ -12,6 +12,7 @@ export const MAX_ATTACHMENT_SIZE_MB =
         : 10;
 export const MAX_ATTACHMENT_SIZE_BYTES = MAX_ATTACHMENT_SIZE_MB * 1024 * 1024;
 export const MAILGUN_API_KEY = process.env.MAILGUN_API_KEY || "";
+export const SUBMIT_API_KEY = process.env.SUBMIT_API_KEY || "";
 export const MAILGUN_FETCH_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
 export const MAX_ROW_DIAGNOSTICS = 50;
 export const SUBMIT_ROUTE =
