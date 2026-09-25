@@ -56,11 +56,35 @@ export const processShipmentFile = async (req, xlsmFile) => {
         throw error;
     }
 
-    const submitResponse = await postToSubmitRoute(
-        shipments,
-        3,
-        req.requestId
-    );
+    let submitResponse;
+    try {
+        submitResponse = await postToSubmitRoute(
+            shipments,
+            3,
+            req.requestId
+        );
+    } catch (error) {
+        // Preserve the useful spreadsheet report when the downstream batch is
+        // rejected. The global error handler only returns these details for
+        // errors that the submission client explicitly marks as safe.
+        error.details = {
+            summary,
+            diagnostics,
+            ...(error.downstreamStatus || error.downstreamErrors?.length
+                ? {
+                    downstream: {
+                        ...(error.downstreamStatus
+                            ? { status: error.downstreamStatus }
+                            : {}),
+                        ...(error.downstreamErrors?.length
+                            ? { errors: error.downstreamErrors }
+                            : {}),
+                    },
+                }
+                : {}),
+        };
+        throw error;
+    }
 
     return {
         ...submitResponse,

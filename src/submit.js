@@ -37,6 +37,41 @@ const parseJsonResponse = (rawResponse) => {
 const isRetriableStatus = (status) =>
     status === 408 || status === 429 || status >= 500;
 
+const truncateText = (value, maxLength = 500) => {
+    const text = String(value ?? "");
+    return text.length > maxLength
+        ? `${text.slice(0, maxLength)}...`
+        : text;
+};
+
+const normalizeDownstreamErrors = (errors) => {
+    if (!Array.isArray(errors)) {
+        return [];
+    }
+
+    return errors.slice(0, 25).map((item) => {
+        if (typeof item === "string") {
+            return { message: truncateText(item) };
+        }
+
+        if (!item || typeof item !== "object") {
+            return { message: truncateText(item) };
+        }
+
+        const normalized = {};
+        ["code", "message", "field", "source_id", "row_number"].forEach(
+            (key) => {
+                if (["string", "number"].includes(typeof item[key])) {
+                    normalized[key] = truncateText(item[key]);
+                }
+            }
+        );
+        return Object.keys(normalized).length > 0
+            ? normalized
+            : { message: "Downstream shipment validation failed" };
+    });
+};
+
 const simplifyPostResponses = (postResponses) => {
     if (!Array.isArray(postResponses) || postResponses.length === 0) {
         return [];
@@ -89,14 +124,21 @@ export const postToSubmitRoute = async (
             const jsonResponse = parseJsonResponse(rawResponse);
 
             if (!response.ok) {
-                const error = new Error(
+                const downstreamMessage = truncateText(
                     jsonResponse.message ||
                     `Downstream submission failed with status ${response.status}`
                 );
+                const error = new Error(downstreamMessage);
                 error.statusCode = 502;
                 error.downstreamStatus = response.status;
-                error.downstreamErrors = jsonResponse.errors;
+                error.downstreamErrors = normalizeDownstreamErrors(
+                    jsonResponse.errors
+                );
                 error.retriable = isRetriableStatus(response.status);
+                error.expose = true;
+                error.code = "SHIPMENT_BATCH_REJECTED";
+                error.publicMessage =
+                    `Shipment submission failed: ${downstreamMessage}`;
                 throw error;
             }
 

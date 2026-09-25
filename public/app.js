@@ -52,6 +52,27 @@ const renderDiagnosticsTable = (diagnostics = []) => {
   `;
 };
 
+const renderDownstreamErrors = (errors = []) => {
+  if (!errors.length) {
+    return "";
+  }
+
+  return `
+    <h3>Submission Diagnostics</h3>
+    <ul class="list">
+      ${errors.map((item) => {
+        const context = [
+          item.row_number ? `Row ${item.row_number}` : "",
+          item.source_id ? `Shipment ${item.source_id}` : "",
+          item.field ? `Field ${item.field}` : "",
+          item.code || "",
+        ].filter(Boolean).join(" — ");
+        return `<li>${context ? `${escapeHtml(context)}: ` : ""}${escapeHtml(item.message || "Shipment validation failed")}</li>`;
+      }).join("")}
+    </ul>
+  `;
+};
+
 const renderReport = (payload, isError = false) => {
   const summary = payload?.summary || {};
   const diagnostics = Array.isArray(payload?.diagnostics)
@@ -61,6 +82,9 @@ const renderReport = (payload, isError = false) => {
   const unknownCustomers = Array.isArray(summary.unknown_customers)
     ? summary.unknown_customers
     : [];
+  const downstreamErrors = Array.isArray(payload?.downstream?.errors)
+    ? payload.downstream.errors
+    : [];
 
   reportEl.classList.remove("hidden", "success", "error");
   reportEl.classList.add(isError ? "error" : "success");
@@ -68,6 +92,8 @@ const renderReport = (payload, isError = false) => {
   reportEl.innerHTML = `
     <h2>${isError ? "Processing Error" : "Processing Complete"}</h2>
     <p><strong>Request ID:</strong> ${escapeHtml(payload?.request_id || "n/a")}</p>
+    ${isError && payload?.message ? `<p><strong>Failure reason:</strong> ${escapeHtml(payload.message)}</p>` : ""}
+    ${isError && payload?.downstream?.status ? `<p><strong>Downstream status:</strong> ${escapeHtml(payload.downstream.status)}</p>` : ""}
     ${payload?.batch_id ? `<p><strong>Downstream Batch ID:</strong> ${escapeHtml(payload.batch_id)}</p>` : ""}
     ${payload?.status_url ? `<p><strong>Status URL:</strong> ${escapeHtml(payload.status_url)}</p>` : ""}
     ${payload?.replayed ? "<p>This shipment batch was already queued; the existing batch was returned.</p>" : ""}
@@ -88,6 +114,7 @@ const renderReport = (payload, isError = false) => {
     <p>${unknownCustomers.length ? escapeHtml(unknownCustomers.join(", ")) : "None"}</p>
     <h3>Row Diagnostics</h3>
     ${renderDiagnosticsTable(diagnostics)}
+    ${renderDownstreamErrors(downstreamErrors)}
   `;
 };
 
@@ -128,8 +155,17 @@ form.addEventListener("submit", async (event) => {
       if (details?.summary) {
         renderReport({
           request_id: payload.request_id,
+          message: payload.message,
           summary: details.summary,
           diagnostics: details.diagnostics || [],
+          downstream: details.downstream,
+        }, true);
+      } else {
+        renderReport({
+          request_id: payload.request_id,
+          message: payload?.message || "Processing failed.",
+          summary: {},
+          diagnostics: [],
         }, true);
       }
       setStatus(payload?.message || "Processing failed.");

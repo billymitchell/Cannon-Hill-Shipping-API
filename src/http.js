@@ -33,6 +33,7 @@ export const requestLogger = (req, res, next) => {
 export const handleError = (request, response, error) => {
     const statusCode = error?.statusCode || error?.status || 500;
     const requestId = request?.requestId;
+    const canExposeDetails = statusCode < 500 || error?.expose === true;
 
     log("Handling error", {
         event: "request_failed",
@@ -42,11 +43,13 @@ export const handleError = (request, response, error) => {
     }, "error");
 
     const userMessage =
-        statusCode >= 500
+        statusCode >= 500 && !error?.expose
             ? "An internal error occurred while processing the request"
+            : error?.publicMessage
+                ? error.publicMessage
             : (error?.message || "Request failed");
     const details =
-        statusCode < 500
+        canExposeDetails
             ? (error?.details || error?.message || "Request failed")
             : undefined;
 
@@ -55,6 +58,9 @@ export const handleError = (request, response, error) => {
         request_id: requestId,
         error: {
             status: statusCode,
+            ...(error?.code && canExposeDetails
+                ? { code: error.code }
+                : {}),
             ...(details ? { details } : {}),
         },
     });
