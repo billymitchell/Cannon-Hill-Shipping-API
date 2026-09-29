@@ -108,6 +108,7 @@ const renderReport = (payload, isError = false) => {
       <li>Duplicate Orders: ${escapeHtml(summary.duplicate_orders_skipped ?? 0)}</li>
       <li>Missing PO: ${escapeHtml(summary.missing_po_skipped ?? 0)}</li>
       <li>Invalid PO: ${escapeHtml(summary.invalid_po_skipped ?? 0)}</li>
+      <li>E GROUP INC. Email/Callout Orders: ${escapeHtml(summary.email_callout_orders_skipped ?? 0)}</li>
       <li>Row Errors: ${escapeHtml(summary.row_errors ?? 0)}</li>
     </ul>
     <h3>Unknown Customer Numbers</h3>

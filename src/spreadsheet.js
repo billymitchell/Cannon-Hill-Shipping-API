@@ -14,6 +14,10 @@ const STORE_ID_MAP = {
     HERO: "14077",
 };
 
+const EMAIL_CALLOUT_CUSTOMERS = {
+    "2400": "E GROUP INC.",
+};
+
 const normalizeRowKeys = (row) => {
     const normalizedData = {};
     Object.keys(row).forEach((key) => {
@@ -123,6 +127,7 @@ export const formatCannonHillData = (results) => {
         duplicate_orders_skipped: 0,
         missing_po_skipped: 0,
         invalid_po_skipped: 0,
+        email_callout_orders_skipped: 0,
         unknown_customers_skipped: 0,
         row_errors: 0,
         unknown_customers: [],
@@ -177,6 +182,21 @@ export const formatCannonHillData = (results) => {
                     rowNumber,
                     "DUPLICATE_ORDER",
                     "Order number was already accepted from an earlier row"
+                );
+                return;
+            }
+
+            const emailCalloutCustomer = EMAIL_CALLOUT_CUSTOMERS[item.Customer_Number];
+            if (emailCalloutCustomer) {
+                summary.email_callout_orders_skipped += 1;
+                addDiagnostic(
+                    rowNumber,
+                    "EMAIL_CALLOUT_ORDER",
+                    `Email/Callout order placed by ${emailCalloutCustomer}`,
+                    {
+                        customer_number: item.Customer_Number,
+                        customer_name: emailCalloutCustomer,
+                    }
                 );
                 return;
             }

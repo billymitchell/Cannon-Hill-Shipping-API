@@ -49,6 +49,16 @@ export const processShipmentFile = async (req, xlsmFile) => {
         }, "warn");
     }
 
+    if (summary.email_callout_orders_skipped > 0) {
+        log("E GROUP INC. Email/Callout orders were identified", {
+            event: "email_callout_orders_skipped",
+            request_id: req.requestId,
+            skipped_row_count: summary.email_callout_orders_skipped,
+            customer_number: "2400",
+            customer_name: "E GROUP INC.",
+        });
+    }
+
     if (shipments.length === 0) {
         const error = new Error("Spreadsheet contained no valid shipments");
         error.statusCode = 422;
