@@ -99,6 +99,7 @@ const renderReport = (payload, isError = false) => {
     ${payload?.replayed ? "<p>This shipment batch was already queued; the existing batch was returned.</p>" : ""}
     <div class="kpis">
       ${renderKpi("Shipments Accepted", summary.shipments_accepted ?? 0)}
+      ${renderKpi("Shipments Ready", summary.shipments_ready ?? summary.shipments_accepted ?? 0)}
       ${renderKpi("Rows Skipped", summary.rows_skipped ?? 0)}
       ${renderKpi("Unknown Customers", summary.unknown_customers_skipped ?? 0)}
       ${renderKpi("Diagnostics Reported", summary.diagnostics_reported ?? diagnostics.length)}
@@ -106,6 +107,7 @@ const renderReport = (payload, isError = false) => {
     <h3>Skip Breakdown</h3>
     <ul class="list">
       <li>Duplicate Orders: ${escapeHtml(summary.duplicate_orders_skipped ?? 0)}</li>
+      <li>Already Accepted: ${escapeHtml(summary.already_accepted_shipments_skipped ?? 0)}</li>
       <li>Missing PO: ${escapeHtml(summary.missing_po_skipped ?? 0)}</li>
       <li>Invalid PO: ${escapeHtml(summary.invalid_po_skipped ?? 0)}</li>
       <li>E GROUP INC. Email/Callout Orders: ${escapeHtml(summary.email_callout_orders_skipped ?? 0)}</li>

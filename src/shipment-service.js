@@ -16,6 +16,9 @@ export const processShipmentFile = async (req, xlsmFile) => {
 
     const rows = await parseXLSMFromBuffer(xlsmFile.buffer, req.requestId);
     const { shipments, summary, diagnostics } = formatCannonHillData(rows);
+    summary.shipments_ready = shipments.length;
+    summary.shipments_accepted = 0;
+    summary.already_accepted_shipments_skipped = 0;
 
     log("Spreadsheet processing completed", {
         event: "spreadsheet_processing_summary",
@@ -95,6 +98,33 @@ export const processShipmentFile = async (req, xlsmFile) => {
         };
         throw error;
     }
+
+    const alreadyAccepted = Array.isArray(submitResponse.duplicate_shipments)
+        ? submitResponse.duplicate_shipments
+        : [];
+    summary.shipments_accepted = submitResponse.shipment_count ?? shipments.length;
+    summary.already_accepted_shipments_skipped = alreadyAccepted.length;
+    summary.rows_skipped += alreadyAccepted.length;
+
+    const availableDiagnosticSlots = Math.max(
+        0,
+        MAX_ROW_DIAGNOSTICS - diagnostics.length
+    );
+    alreadyAccepted
+        .slice(0, availableDiagnosticSlots)
+        .forEach((shipment) => {
+            diagnostics.push({
+                row_number: shipment.row_number,
+                code: "ALREADY_ACCEPTED",
+                message: "Shipment was already accepted by the downstream service",
+                source_id: shipment.source_id,
+            });
+        });
+    summary.diagnostics_reported = diagnostics.length;
+    summary.diagnostics_omitted += Math.max(
+        0,
+        alreadyAccepted.length - availableDiagnosticSlots
+    );
 
     return {
         ...submitResponse,

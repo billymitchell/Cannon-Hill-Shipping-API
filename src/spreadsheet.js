@@ -226,6 +226,14 @@ export const formatCannonHillData = (results) => {
                 carrier_code: carrierCode,
                 shipment_method: shipmentMethod || "Residential",
             });
+            Object.defineProperty(
+                shipments[shipments.length - 1],
+                "__source_row_number",
+                {
+                    value: rowNumber,
+                    enumerable: false,
+                }
+            );
             uniqueOrderIds.add(orderId);
         } catch (error) {
             summary.row_errors += 1;

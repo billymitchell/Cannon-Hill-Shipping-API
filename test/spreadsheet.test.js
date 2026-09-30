@@ -34,3 +34,21 @@ test("unrecognized customer numbers remain unknown", () => {
     assert.equal(summary.unknown_customers_skipped, 1);
     assert.equal(diagnostics[0].code, "UNKNOWN_CUSTOMER");
 });
+
+test("keeps the source row available without sending it downstream", () => {
+    const row = {
+        Customer_Number: "RTSCS",
+        Cust_PO_Number: "Order 12345",
+        Tracking_Number: "tracking-number",
+        Shipped_VIA: "UPS-G",
+    };
+    Object.defineProperty(row, "__source_row_number", {
+        value: 42,
+        enumerable: false,
+    });
+
+    const { shipments } = formatCannonHillData([row]);
+
+    assert.equal(shipments[0].__source_row_number, 42);
+    assert.equal(JSON.stringify(shipments).includes("__source_row_number"), false);
+});

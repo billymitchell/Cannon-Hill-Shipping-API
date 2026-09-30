@@ -37,6 +37,23 @@ const parseJsonResponse = (rawResponse) => {
 const isRetriableStatus = (status) =>
     status === 408 || status === 429 || status >= 500;
 
+const isAlreadyAcceptedConflict = (error) => {
+    if (error?.downstreamStatus !== 409) {
+        return false;
+    }
+
+    const messages = [
+        error.message,
+        ...(Array.isArray(error.downstreamErrors)
+            ? error.downstreamErrors.map((item) => item?.message)
+            : []),
+    ];
+
+    return messages.some((message) =>
+        /\balready (?:been )?accepted\b/i.test(String(message || ""))
+    );
+};
+
 const truncateText = (value, maxLength = 500) => {
     const text = String(value ?? "");
     return text.length > maxLength
@@ -93,10 +110,11 @@ const simplifyPostResponses = (postResponses) => {
     });
 };
 
-export const postToSubmitRoute = async (
+const submitBatch = async (
     data,
     retries = 3,
-    requestId = null
+    requestId = null,
+    fetchImpl = fetch
 ) => {
     if (!Array.isArray(data) || data.length === 0) {
         const error = new Error("No valid data to send to submit route");
@@ -115,7 +133,7 @@ export const postToSubmitRoute = async (
             const attemptStartedAt = Date.now();
             const headers = buildSubmitHeaders(data);
 
-            const response = await fetch(SUBMIT_ROUTE, {
+            const response = await fetchImpl(SUBMIT_ROUTE, {
                 method: 'POST',
                 headers,
                 body: JSON.stringify(data),
@@ -184,12 +202,17 @@ export const postToSubmitRoute = async (
         } catch (error) {
             const isFinalAttempt =
                 attempt === retries || error.retriable === false;
+            const recoverableConflict = isAlreadyAcceptedConflict(error);
             log(
-                isFinalAttempt
+                recoverableConflict
+                    ? "Shipment batch contains already accepted shipments"
+                    : isFinalAttempt
                     ? "Shipment batch submission failed"
                     : "Shipment batch submission failed; retrying",
                 {
-                    event: isFinalAttempt
+                    event: recoverableConflict
+                        ? "shipment_batch_already_accepted_conflict"
+                        : isFinalAttempt
                         ? "shipment_batch_failed"
                         : "shipment_batch_retry",
                     request_id: requestId,
@@ -197,7 +220,7 @@ export const postToSubmitRoute = async (
                     max_attempts: retries,
                     error,
                 },
-                isFinalAttempt ? "error" : "warn"
+                isFinalAttempt && !recoverableConflict ? "error" : "warn"
             );
 
             if (isFinalAttempt) {
@@ -206,4 +229,118 @@ export const postToSubmitRoute = async (
             await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
         }
     }
+};
+
+const submitRecoverableBatch = async (
+    data,
+    retries,
+    requestId,
+    fetchImpl
+) => {
+    try {
+        const response = await submitBatch(data, retries, requestId, fetchImpl);
+        return { batches: [response], duplicateShipments: [] };
+    } catch (error) {
+        if (!isAlreadyAcceptedConflict(error)) {
+            throw error;
+        }
+
+        if (data.length === 1) {
+            const shipment = data[0];
+            log("Already accepted shipment skipped", {
+                event: "shipment_already_accepted",
+                request_id: requestId,
+                row_number: shipment.__source_row_number || null,
+            }, "warn");
+            return {
+                batches: [],
+                duplicateShipments: [{
+                    source_id: shipment.source_id,
+                    row_number: shipment.__source_row_number || null,
+                }],
+            };
+        }
+
+        const midpoint = Math.ceil(data.length / 2);
+        log("Splitting shipment batch to isolate already accepted shipments", {
+            event: "shipment_batch_duplicate_isolation",
+            request_id: requestId,
+            shipment_count: data.length,
+            first_batch_count: midpoint,
+            second_batch_count: data.length - midpoint,
+        }, "warn");
+
+        const first = await submitRecoverableBatch(
+            data.slice(0, midpoint),
+            retries,
+            requestId,
+            fetchImpl
+        );
+        const second = await submitRecoverableBatch(
+            data.slice(midpoint),
+            retries,
+            requestId,
+            fetchImpl
+        );
+
+        return {
+            batches: [...first.batches, ...second.batches],
+            duplicateShipments: [
+                ...first.duplicateShipments,
+                ...second.duplicateShipments,
+            ],
+        };
+    }
+};
+
+export const postToSubmitRoute = async (
+    data,
+    retries = 3,
+    requestId = null,
+    fetchImpl = fetch
+) => {
+    if (!Array.isArray(data) || data.length === 0) {
+        const error = new Error("No valid data to send to submit route");
+        error.statusCode = 422;
+        throw error;
+    }
+
+    const { batches, duplicateShipments } = await submitRecoverableBatch(
+        data,
+        retries,
+        requestId,
+        fetchImpl
+    );
+
+    if (duplicateShipments.length === 0 && batches.length === 1) {
+        return batches[0];
+    }
+
+    const shipmentCount = data.length - duplicateShipments.length;
+    const queued = batches.some((batch) => batch.status === "queued");
+    const allAlreadyAccepted = shipmentCount === 0;
+
+    return {
+        status: allAlreadyAccepted
+            ? "already_accepted"
+            : (queued ? "queued" : "success"),
+        message: allAlreadyAccepted
+            ? "All shipments were already accepted"
+            : `${shipmentCount} shipment${shipmentCount === 1 ? "" : "s"} accepted; ${duplicateShipments.length} already accepted shipment${duplicateShipments.length === 1 ? "" : "s"} skipped`,
+        execution_time: "N/A",
+        results: batches.flatMap((batch) => batch.results || []),
+        batch_id: batches.length === 1 ? batches[0].batch_id : null,
+        shipment_count: shipmentCount,
+        status_url: batches.length === 1 ? batches[0].status_url : null,
+        replayed:
+            batches.length > 0 && batches.every((batch) => batch.replayed),
+        batch_count: batches.length,
+        batches: batches.map((batch) => ({
+            batch_id: batch.batch_id,
+            status: batch.status,
+            status_url: batch.status_url,
+            shipment_count: batch.shipment_count,
+        })),
+        duplicate_shipments: duplicateShipments,
+    };
 };
